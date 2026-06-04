@@ -65,6 +65,23 @@ impl<T> Promise<T> {
     }
 }
 
+impl<T> Drop for Promise<T> {
+    /// If the promise is dropped without ever being fulfilled, resolve the
+    /// associated future with a `BrokenPromise` error rather than leaving it
+    /// pending forever. This matches the conventional sender-drop-cancels-
+    /// receiver semantics (cf. `oneshot`) and prevents `await` from hanging
+    /// when a producer bails out before calling `ok`/`err`/`result`.
+    fn drop(&mut self) {
+        let mut core = self.core.lock().unwrap();
+        if core.result.is_none() {
+            core.result.replace(Err(BrokenPromise {}.into()));
+            if let Some(waker) = core.waker.take() {
+                waker.wake();
+            }
+        }
+    }
+}
+
 impl<T: Send + 'static> Future<T> {
     /// Create a leaf future which is immediately ready with
     /// the provided value
