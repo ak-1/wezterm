@@ -7541,6 +7541,7 @@ dependencies = [
  "gl_generator",
  "glium",
  "guillotiere",
+ "image",
  "k9",
  "lazy_static",
  "libc",

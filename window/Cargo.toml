@@ -49,6 +49,7 @@ wezterm-input-types.workspace = true
 
 [target."cfg(windows)".dependencies]
 clipboard-win.workspace = true
+image.workspace = true
 shared_library.workspace = true
 winapi = { workspace=true, features = [
     "dwmapi",
