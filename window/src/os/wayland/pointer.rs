@@ -5,7 +5,7 @@ use std::time::Duration;
 use smithay_client_toolkit::compositor::SurfaceData;
 use smithay_client_toolkit::reexports::csd_frame::{DecorationsFrame, FrameClick};
 use smithay_client_toolkit::seat::pointer::{
-    PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
+    CursorIcon, PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
 };
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
@@ -23,7 +23,7 @@ use super::WaylandConnection;
 impl PointerHandler for WaylandState {
     fn pointer_frame(
         &mut self,
-        _conn: &Connection,
+        conn: &Connection,
         _qh: &QueueHandle<Self>,
         pointer: &WlPointer,
         events: &[PointerEvent],
@@ -58,7 +58,7 @@ impl PointerHandler for WaylandState {
                 }
             }
         }
-        self.pointer_window_frame(pointer, events);
+        self.pointer_window_frame(conn, pointer, events);
     }
 }
 
@@ -201,8 +201,18 @@ fn event_serial(event: &PointerEvent) -> Option<u32> {
 }
 
 impl WaylandState {
-    fn pointer_window_frame(&mut self, pointer: &WlPointer, events: &[PointerEvent]) {
+    fn pointer_window_frame(
+        &mut self,
+        conn: &Connection,
+        pointer: &WlPointer,
+        events: &[PointerEvent],
+    ) {
         let windows = self.windows.borrow();
+
+        // The cursor shape the frame wants for the region under the pointer, if
+        // the pointer is currently over a (visible) frame surface. We apply it
+        // after the loop, once the per-window borrow has been released.
+        let mut frame_cursor: Option<Option<CursorIcon>> = None;
 
         for evt in events {
             let surface = &evt.surface;
@@ -221,23 +231,29 @@ impl WaylandState {
 
                 match evt.kind {
                     PointerEventKind::Enter { .. } => {
-                        inner.window_frame.click_point_moved(
+                        let icon = inner.window_frame.click_point_moved(
                             Duration::ZERO,
                             &evt.surface.id(),
                             x,
                             y,
                         );
+                        if !inner.window_frame.is_hidden() {
+                            frame_cursor = Some(icon);
+                        }
                     }
                     PointerEventKind::Leave { .. } => {
                         inner.window_frame.click_point_left();
                     }
                     PointerEventKind::Motion { .. } => {
-                        inner.window_frame.click_point_moved(
+                        let icon = inner.window_frame.click_point_moved(
                             Duration::ZERO,
                             &evt.surface.id(),
                             x,
                             y,
                         );
+                        if !inner.window_frame.is_hidden() {
+                            frame_cursor = Some(icon);
+                        }
                     }
                     PointerEventKind::Press { button, serial, .. }
                     | PointerEventKind::Release { button, serial, .. } => {
@@ -258,6 +274,22 @@ impl WaylandState {
                         }
                     }
                     _ => {}
+                }
+            }
+        }
+
+        drop(windows);
+
+        // SCTK's frame tells us which cursor to show for the region under the
+        // pointer (resize arrows on the borders/corners, the default arrow over
+        // the title bar). It does *not* apply it for us; without this the cursor
+        // would keep whatever shape the terminal area last requested (typically
+        // the text I-beam) while hovering the decorations.
+        if let Some(icon) = frame_cursor {
+            if let Some(themed_pointer) = &self.pointer {
+                let icon = icon.unwrap_or(CursorIcon::Default);
+                if let Err(err) = themed_pointer.set_cursor(conn, icon) {
+                    log::error!("set_cursor (frame): {}", err);
                 }
             }
         }
