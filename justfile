@@ -65,15 +65,15 @@ deps:
 
 # Build the GUI package via the Nix flake (lives in nix/)
 nix-build:
-    nix build '.?dir=nix'
+    nix build 'git+file:.?dir=nix'
 
 # Build the headless (wezterm + mux-server) Nix package
 nix-build-headless:
-    nix build '.?dir=nix#default.headless'
+    nix build 'git+file:.?dir=nix#default.headless'
 
 # Enter the Nix dev shell with the pinned toolchain
 nix-shell:
-    nix develop '.?dir=nix'
+    nix develop 'git+file:.?dir=nix'
 
 # Remove build artifacts
 clean:
