@@ -939,10 +939,34 @@ impl WaylandWindowInner {
             }
         }
 
+        let granted_decoration_mode = pending.window_configure.as_ref().map(|c| c.decoration_mode);
         if let Some(ref window_config) = pending.window_configure {
             self.window_frame.update_state(window_config.state);
             self.window_frame
                 .update_wm_capabilities(window_config.capabilities);
+        }
+
+        // React to the decoration mode the compositor actually granted, which
+        // can differ from what we requested at creation time. Notably, when we
+        // ask for server-side decorations (the default) but the compositor only
+        // offers client-side (e.g. GNOME/mutter), we must un-hide our own frame
+        // here; otherwise the window would end up with no decorations at all.
+        if let Some(mode) = granted_decoration_mode {
+            let want_decorations = self.config.window_decorations != WindowDecorations::NONE;
+            let should_hide = !want_decorations || matches!(mode, DecorationMode::Server);
+            if self.window_frame.is_hidden() != should_hide {
+                self.window_frame.set_hidden(should_hide);
+                pending.refresh_decorations = true;
+                // Ensure the frame is (re)sized and the window geometry is
+                // recomputed for the new decoration state, even if this
+                // configure carried no new size.
+                if pending.configure.is_none() {
+                    pending.configure.replace((
+                        self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
+                        self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
+                    ));
+                }
+            }
         }
 
         if let Some((mut w, mut h)) = pending.configure.take() {
