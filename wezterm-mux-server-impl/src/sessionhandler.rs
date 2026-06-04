@@ -143,6 +143,23 @@ impl PerPane {
     }
 }
 
+/// Write a pasted clipboard image to a uniquely-named PNG file in the system
+/// temp dir on the host running the pane, returning the path as a string.
+/// The filename intentionally contains no spaces so that path-aware tools can
+/// detect it without quoting (quoting can defeat that detection).
+fn write_paste_image_tempfile(pane_id: PaneId, data: &[u8]) -> anyhow::Result<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("wezterm-paste-{}-{}.png", pane_id, nanos));
+    std::fs::write(&path, data)
+        .with_context(|| format!("writing pasted image to {}", path.display()))?;
+    log::debug!("wrote {} bytes of pasted image to {}", data.len(), path.display());
+    Ok(path.to_string_lossy().into_owned())
+}
+
 fn maybe_push_pane_changes(
     pane: &Arc<dyn Pane>,
     sender: PduSender,
@@ -500,6 +517,30 @@ impl SessionHandler {
                                 .get_pane(pane_id)
                                 .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
                             pane.send_paste(&data)?;
+                            maybe_push_pane_changes(&pane, sender, per_pane)?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
+            Pdu::SendImagePaste(SendImagePaste { pane_id, data }) => {
+                let sender = self.to_write_tx.clone();
+                let per_pane = self.per_pane(pane_id);
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let pane = mux
+                                .get_pane(pane_id)
+                                .ok_or_else(|| anyhow!("no such pane {}", pane_id))?;
+                            // Materialize the image on the host running the pane,
+                            // then paste its path so that path-aware tools (e.g.
+                            // Claude Code) can load it from the local filesystem.
+                            let path = write_paste_image_tempfile(pane_id, &data)?;
+                            pane.send_paste(&path)?;
                             maybe_push_pane_changes(&pane, sender, per_pane)?;
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },

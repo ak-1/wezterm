@@ -441,7 +441,7 @@ macro_rules! pdu {
 /// The overall version of the codec.
 /// This must be bumped when backwards incompatible changes
 /// are made to the types and protocol.
-pub const CODEC_VERSION: usize = 45;
+pub const CODEC_VERSION: usize = 46;
 
 // Defines the Pdu enum.
 // Each struct has an explicit identifying number.
@@ -502,6 +502,7 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    SendImagePaste: 63,
 }
 
 impl Pdu {
@@ -514,6 +515,7 @@ impl Pdu {
             | Self::SendKeyDown(_)
             | Self::SendMouseEvent(_)
             | Self::SendPaste(_)
+            | Self::SendImagePaste(_)
             | Self::Resize(_)
             | Self::SetClipboard(_)
             | Self::SetPaneZoomed(_)
@@ -594,6 +596,7 @@ impl Pdu {
             | Pdu::SetPalette(SetPalette { pane_id, .. })
             | Pdu::NotifyAlert(NotifyAlert { pane_id, .. })
             | Pdu::SetClipboard(SetClipboard { pane_id, .. })
+            | Pdu::SendImagePaste(SendImagePaste { pane_id, .. })
             | Pdu::PaneFocused(PaneFocused { pane_id })
             | Pdu::PaneRemoved(PaneRemoved { pane_id }) => Some(*pane_id),
             _ => None,
@@ -713,6 +716,16 @@ pub struct WriteToPane {
 pub struct SendPaste {
     pub pane_id: PaneId,
     pub data: String,
+}
+
+/// Sent by the client to deliver a clipboard image to the pane's host.
+/// The server writes the (PNG) bytes to a temporary file on the host
+/// running the pane and pastes the resulting file path into the pane.
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SendImagePaste {
+    pub pane_id: PaneId,
+    /// PNG-encoded image data.
+    pub data: Vec<u8>,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

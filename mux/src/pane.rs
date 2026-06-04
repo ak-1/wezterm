@@ -28,6 +28,21 @@ pub fn alloc_pane_id() -> PaneId {
     PANE_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Write a pasted clipboard image to a uniquely-named PNG file in the local
+/// system temp dir, returning its path. The filename contains no spaces so
+/// that path-aware tools can detect it without quoting.
+pub fn write_local_paste_image_tempfile(pane_id: PaneId, data: &[u8]) -> anyhow::Result<String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("wezterm-paste-{}-{}.png", pane_id, nanos));
+    std::fs::write(&path, data)
+        .map_err(|e| anyhow::anyhow!("writing pasted image to {}: {}", path.display(), e))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PerformAssignmentResult {
     /// Continue search for handler
@@ -236,6 +251,15 @@ pub trait Pane: Downcast + Send + Sync {
         Progress::None
     }
     fn send_paste(&self, text: &str) -> anyhow::Result<()>;
+    /// Paste an image (PNG bytes) into the pane. The default implementation
+    /// writes the image to a temporary file on the local filesystem and pastes
+    /// its path, so that path-aware tools (e.g. Claude Code) can load it.
+    /// Panes whose process runs on a different host (e.g. a multiplexer client)
+    /// override this to deliver the image to that host instead.
+    fn send_image_paste(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        let path = write_local_paste_image_tempfile(self.pane_id(), &data)?;
+        self.send_paste(&path)
+    }
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>>;
     fn writer(&self) -> MappedMutexGuard<'_, dyn std::io::Write>;
     fn resize(&self, size: TerminalSize) -> anyhow::Result<()>;
