@@ -58,6 +58,18 @@ use crate::{
     WindowEventSender, WindowKeyEvent, WindowOps, WindowState,
 };
 
+/// Whether WezTerm should display SCTK's fallback client-side-decoration frame
+/// (a title bar plus resize borders). We only want it when the user asked for a
+/// title bar (`TITLE`) and is *not* having WezTerm draw its own integrated
+/// window buttons. For `INTEGRATED_BUTTONS`, `RESIZE`-only and `NONE` we either
+/// draw the decorations ourselves (integrated buttons + an internal resize
+/// border) or omit them entirely, so the fallback frame must stay hidden;
+/// otherwise we'd end up with a duplicate title bar stacked above our own.
+fn wants_fallback_frame(decorations: WindowDecorations) -> bool {
+    decorations.contains(WindowDecorations::TITLE)
+        && !decorations.contains(WindowDecorations::INTEGRATED_BUTTONS)
+}
+
 /// Wayland-specific coordinate conversion methods for Dimensions
 trait WaylandDimensions {
     fn dpi_factor(&self) -> f64;
@@ -263,10 +275,12 @@ impl WaylandWindow {
             FallbackFrame::new(&window, shm, subcompositor, qh.clone())
                 .expect("failed to create csd frame")
         };
-        let hidden = match decor_mode {
-            Some(DecorationMode::Client) => false,
-            _ => true,
-        };
+        // Only show the fallback frame when we actually want its title bar and
+        // the compositor granted client-side decorations. For the default
+        // (Server) request the frame stays hidden until `dispatch_pending_event`
+        // sees the compositor force Client mode (e.g. GNOME/mutter).
+        let hidden =
+            !wants_fallback_frame(decorations) || decor_mode != Some(DecorationMode::Client);
         window_frame.set_hidden(hidden);
         if !hidden {
             window_frame.resize(
@@ -552,14 +566,18 @@ impl WindowOps for WaylandWindow {
     ) -> anyhow::Result<Option<crate::os::parameters::Parameters>> {
         let _ = window_state;
         // On Wayland we are responsible for resizing the window whenever we
-        // draw client-side decorations. We advertise that here so the GUI can
+        // don't fall back to SCTK's frame (which is hidden for INTEGRATED_BUTTONS
+        // and RESIZE-only configs). We advertise that here so the GUI can
         // present a comfortable internal resize border (SCTK's own border is
         // only a few pixels wide, which makes corner resize nearly unusable).
+        // INTEGRATED_BUTTONS implies a resizable window to match the X11 backend,
+        // even when the RESIZE flag is not also set.
         let decorations = config.window_decorations;
         let client_side_decorations =
             decorations != WindowDecorations::NONE && decorations != WindowDecorations::default();
-        let client_side_resize =
-            client_side_decorations && decorations.contains(WindowDecorations::RESIZE);
+        let client_side_resize = client_side_decorations
+            && (decorations.contains(WindowDecorations::RESIZE)
+                || decorations.contains(WindowDecorations::INTEGRATED_BUTTONS));
 
         Ok(Some(crate::os::parameters::Parameters {
             title_bar: Default::default(),
@@ -952,8 +970,8 @@ impl WaylandWindowInner {
         // offers client-side (e.g. GNOME/mutter), we must un-hide our own frame
         // here; otherwise the window would end up with no decorations at all.
         if let Some(mode) = granted_decoration_mode {
-            let want_decorations = self.config.window_decorations != WindowDecorations::NONE;
-            let should_hide = !want_decorations || matches!(mode, DecorationMode::Server);
+            let should_hide = !wants_fallback_frame(self.config.window_decorations)
+                || matches!(mode, DecorationMode::Server);
             if self.window_frame.is_hidden() != should_hide {
                 self.window_frame.set_hidden(should_hide);
                 pending.refresh_decorations = true;
