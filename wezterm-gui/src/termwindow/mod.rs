@@ -2716,6 +2716,9 @@ impl TermWindow {
             PasteFrom(source) => {
                 self.paste_from_clipboard(pane, *source);
             }
+            PasteImageFrom(source) => {
+                self.paste_image_from_clipboard(pane, *source);
+            }
             ActivateTabRelative(n) => {
                 self.activate_tab_relative(*n, true)?;
             }

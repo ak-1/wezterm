@@ -353,6 +353,26 @@ impl Pane for ClientPane {
         Ok(())
     }
 
+    fn send_image_paste(&self, data: Vec<u8>) -> anyhow::Result<()> {
+        // The pane's process runs on the remote mux server, so deliver the
+        // image bytes there; the server writes them to a temp file on its host
+        // and pastes the resulting path.
+        let client = Arc::clone(&self.client);
+        let remote_pane_id = self.remote_pane_id;
+        promise::spawn::spawn(async move {
+            client
+                .client
+                .send_image_paste(SendImagePaste {
+                    pane_id: remote_pane_id,
+                    data,
+                })
+                .await
+        })
+        .detach();
+        self.renderable.lock().inner.borrow_mut().update_last_send();
+        Ok(())
+    }
+
     fn reader(&self) -> anyhow::Result<Option<Box<dyn std::io::Read + Send>>> {
         Ok(None)
     }
