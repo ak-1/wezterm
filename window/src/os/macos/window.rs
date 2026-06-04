@@ -937,6 +937,7 @@ impl WindowOps for Window {
             },
             border_dimensions,
             client_side_resize: false,
+            compositor_driven_move: false,
         }))
     }
 }
