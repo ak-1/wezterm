@@ -936,6 +936,7 @@ impl WindowOps for Window {
                 font_and_size: None,
             },
             border_dimensions,
+            client_side_resize: false,
         }))
     }
 }
@@ -1228,6 +1229,12 @@ impl WindowInner {
                     MouseCursor::Hand => msg_send![ns_cursor_cls, pointingHandCursor],
                     MouseCursor::SizeUpDown => msg_send![ns_cursor_cls, resizeUpDownCursor],
                     MouseCursor::SizeLeftRight => msg_send![ns_cursor_cls, resizeLeftRightCursor],
+                    // macOS lacks public diagonal-resize cursors; the diagonal
+                    // variants are only requested by the Wayland client-side
+                    // resize path, so fall back to the arrow here.
+                    MouseCursor::SizeNwSe | MouseCursor::SizeNeSw => {
+                        msg_send![ns_cursor_cls, arrowCursor]
+                    }
                 };
                 let () = msg_send![ns_cursor_cls, setHiddenUntilMouseMoves: NO];
                 let () = msg_send![instance, set];

@@ -71,6 +71,24 @@ pub enum MouseCursor {
     Text,
     SizeUpDown,
     SizeLeftRight,
+    /// Diagonal resize cursor running top-left <-> bottom-right
+    SizeNwSe,
+    /// Diagonal resize cursor running top-right <-> bottom-left
+    SizeNeSw,
+}
+
+/// Identifies which edge or corner of a window an interactive resize
+/// should be anchored to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResizeEdge {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 /// Represents the preferred appearance of the windowing
@@ -291,6 +309,15 @@ pub trait WindowOps {
     /// This is only implemented on backends that handle
     /// window movement on the server side (Wayland).
     fn request_drag_move(&self) {}
+
+    /// Requests the windowing system to start an interactive resize of
+    /// the window, anchored to the given edge or corner.
+    ///
+    /// This is only implemented on backends that handle resizing on the
+    /// server side (Wayland). The GUI offers an internal resize border
+    /// (driving this) when the backend advertises `client_side_resize`
+    /// via [`WindowOps::get_os_parameters`].
+    fn request_drag_resize(&self, _edge: ResizeEdge) {}
 
     /// Signal to the windowing system that the mouse is over
     /// a window dragging area.

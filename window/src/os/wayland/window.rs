@@ -538,6 +538,36 @@ impl WindowOps for WaylandWindow {
         });
     }
 
+    fn request_drag_resize(&self, edge: crate::ResizeEdge) {
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner.request_drag_resize(edge);
+            Ok(())
+        });
+    }
+
+    fn get_os_parameters(
+        &self,
+        config: &ConfigHandle,
+        window_state: WindowState,
+    ) -> anyhow::Result<Option<crate::os::parameters::Parameters>> {
+        let _ = window_state;
+        // On Wayland we are responsible for resizing the window whenever we
+        // draw client-side decorations. We advertise that here so the GUI can
+        // present a comfortable internal resize border (SCTK's own border is
+        // only a few pixels wide, which makes corner resize nearly unusable).
+        let decorations = config.window_decorations;
+        let client_side_decorations =
+            decorations != WindowDecorations::NONE && decorations != WindowDecorations::default();
+        let client_side_resize =
+            client_side_decorations && decorations.contains(WindowDecorations::RESIZE);
+
+        Ok(Some(crate::os::parameters::Parameters {
+            title_bar: Default::default(),
+            border_dimensions: None,
+            client_side_resize,
+        }))
+    }
+
     fn config_did_change(&self, config: &ConfigHandle) {
         let config = config.clone();
         WaylandConnection::with_window_inner(self.0, move |inner| {
@@ -1054,6 +1084,8 @@ impl WaylandWindowInner {
                         MouseCursor::Hand => CursorIcon::Pointer,
                         MouseCursor::SizeUpDown => CursorIcon::NsResize,
                         MouseCursor::SizeLeftRight => CursorIcon::EwResize,
+                        MouseCursor::SizeNwSe => CursorIcon::NwseResize,
+                        MouseCursor::SizeNeSw => CursorIcon::NeswResize,
                         MouseCursor::Text => CursorIcon::Text,
                     },
                 ) {
@@ -1354,6 +1386,37 @@ impl WaylandWindowInner {
                 }
             }
             None => log::warn!("request_drag_move: no pointer to drive the move"),
+        }
+    }
+
+    /// Ask the compositor to begin an interactive resize anchored to the
+    /// given edge/corner. As with [`Self::request_drag_move`], the compositor
+    /// owns the drag once `xdg_toplevel.resize` is issued.
+    fn request_drag_resize(&self, edge: crate::ResizeEdge) {
+        let window = match self.window.as_ref() {
+            Some(window) => window,
+            None => return,
+        };
+        let edge = match edge {
+            crate::ResizeEdge::Top => XdgResizeEdge::Top,
+            crate::ResizeEdge::Bottom => XdgResizeEdge::Bottom,
+            crate::ResizeEdge::Left => XdgResizeEdge::Left,
+            crate::ResizeEdge::Right => XdgResizeEdge::Right,
+            crate::ResizeEdge::TopLeft => XdgResizeEdge::TopLeft,
+            crate::ResizeEdge::TopRight => XdgResizeEdge::TopRight,
+            crate::ResizeEdge::BottomLeft => XdgResizeEdge::BottomLeft,
+            crate::ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
+        };
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        let serial = *state.last_serial.borrow();
+        match state.pointer.as_ref() {
+            Some(pointer) => {
+                if let Some(pdata) = pointer.pointer().data::<PointerUserData>() {
+                    window.resize(pdata.pdata.seat(), serial, edge);
+                }
+            }
+            None => log::warn!("request_drag_resize: no pointer to drive the resize"),
         }
     }
 
