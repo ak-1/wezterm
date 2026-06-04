@@ -265,6 +265,17 @@ impl super::TermWindow {
                     );
                     // and now tell the window to go there
                     context.set_window_position(top_left);
+                    // On Wayland (and X11) the window manager owns the window
+                    // position, so `set_window_position` is a no-op and the move
+                    // must instead be driven by the compositor. Initiate that
+                    // interactive move here, on the first drag motion, rather
+                    // than eagerly on the initial press: starting it on press
+                    // hands the pointer to the compositor's move grab, which
+                    // swallows the rest of the click sequence and breaks click /
+                    // double-click handling on the tab bar (e.g. double-click to
+                    // maximize). `request_drag_move` is a no-op on platforms that
+                    // move via `set_window_position` (Windows, macOS).
+                    context.request_drag_move();
                     return;
                 }
 
@@ -573,11 +584,14 @@ impl super::TermWindow {
                             }
                         }
                     }
-                    // Potentially starting a drag by the tab bar
+                    // Potentially starting a drag by the tab bar. We only record
+                    // the start position here; the actual interactive move is
+                    // kicked off from the WMEK::Move handler once the pointer is
+                    // actually dragged, so that a plain click or double-click on
+                    // the tab bar is still delivered to us intact.
                     if !maximized {
                         self.window_drag_position.replace(event.clone());
                     }
-                    context.request_drag_move();
                 }
                 TabBarItem::WindowButton(button) => {
                     use window::IntegratedTitleButton as Button;
