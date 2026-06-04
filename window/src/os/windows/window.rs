@@ -755,6 +755,77 @@ impl HasWindowHandle for Window {
     }
 }
 
+/// Read the current clipboard image and return it as PNG-encoded bytes.
+///
+/// Prefers a `PNG` clipboard payload when one is present (lossless and already
+/// in the right format); otherwise falls back to a device-independent bitmap
+/// (what the Snipping Tool and print-screen place on the clipboard), which we
+/// decode and re-encode as PNG.
+fn read_clipboard_image_png() -> anyhow::Result<Vec<u8>> {
+    use clipboard_win::formats::{CF_DIB, CF_DIBV5};
+    use clipboard_win::{raw, register_format, Clipboard};
+
+    // Opening the clipboard can fail transiently while another application
+    // holds it open; the caller treats any error as "no image".
+    let _clip = Clipboard::new().map_err(|e| anyhow::anyhow!("opening clipboard: {}", e))?;
+
+    if let Ok(png_format) = register_format("PNG") {
+        if raw::is_format_avail(png_format) {
+            if let Some(bytes) = read_clipboard_format(png_format) {
+                return Ok(bytes);
+            }
+        }
+    }
+
+    // CF_DIBV5 carries an alpha channel; prefer it over CF_DIB.
+    for format in [CF_DIBV5, CF_DIB] {
+        if raw::is_format_avail(format) {
+            if let Some(dib) = read_clipboard_format(format) {
+                return dib_to_png(&dib);
+            }
+        }
+    }
+
+    bail!("clipboard does not contain an image");
+}
+
+/// Copy the raw bytes of a clipboard format out into a `Vec`.
+/// Assumes the clipboard is already open.
+fn read_clipboard_format(format: u32) -> Option<Vec<u8>> {
+    let size = clipboard_win::raw::size(format)?;
+    let mut buf = vec![0u8; size];
+    match clipboard_win::raw::get(format, &mut buf) {
+        Ok(copied) => {
+            buf.truncate(copied);
+            Some(buf)
+        }
+        Err(err) => {
+            log::error!("reading clipboard format {}: {}", format, err);
+            None
+        }
+    }
+}
+
+/// Decode a device-independent bitmap (a DIB without the 14-byte
+/// `BITMAPFILEHEADER`, as stored on the Windows clipboard) and re-encode it as
+/// PNG.
+fn dib_to_png(dib: &[u8]) -> anyhow::Result<Vec<u8>> {
+    use image::codecs::bmp::BmpDecoder;
+    use image::{DynamicImage, ImageFormat};
+    use std::io::Cursor;
+
+    let decoder = BmpDecoder::new_without_file_header(Cursor::new(dib))
+        .map_err(|e| anyhow::anyhow!("decoding clipboard DIB: {}", e))?;
+    let image = DynamicImage::from_decoder(decoder)
+        .map_err(|e| anyhow::anyhow!("decoding clipboard DIB: {}", e))?;
+
+    let mut png = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+        .map_err(|e| anyhow::anyhow!("encoding clipboard image as PNG: {}", e))?;
+    Ok(png)
+}
+
 #[async_trait(?Send)]
 impl WindowOps for Window {
     async fn enable_opengl(&self) -> anyhow::Result<Rc<glium::backend::Context>> {
@@ -963,6 +1034,10 @@ impl WindowOps for Window {
                 .map(|s| s.replace("\r\n", "\n"))
                 .context("Error getting clipboard"),
         )
+    }
+
+    fn get_clipboard_image_data(&self) -> Future<Vec<u8>> {
+        Future::result(read_clipboard_image_png())
     }
 
     fn set_clipboard(&self, _clipboard: Clipboard, text: String) {
