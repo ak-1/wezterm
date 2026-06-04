@@ -492,11 +492,16 @@ impl WindowOps for WaylandWindow {
         let future = promise.get_future().unwrap();
         let promise = Arc::new(Mutex::new(promise));
         WaylandConnection::with_window_inner(self.0, move |inner| {
-            let read = inner
-                .copy_and_paste
-                .lock()
-                .unwrap()
-                .get_clipboard_image_data()?;
+            let read = match inner.copy_and_paste.lock().unwrap().get_clipboard_image_data() {
+                Ok(read) => read,
+                Err(e) => {
+                    // No image on the clipboard (or no data offer). Resolve the
+                    // future with an error immediately so the caller can fall
+                    // back to a text paste instead of awaiting forever.
+                    promise.lock().unwrap().err(anyhow!("{}", e));
+                    return Ok(());
+                }
+            };
             let promise = Arc::clone(&promise);
             std::thread::spawn(move || {
                 let mut promise = promise.lock().unwrap();
