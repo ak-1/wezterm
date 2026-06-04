@@ -19,6 +19,7 @@ pub const SB_H_DOUBLE_ARROW: u16 = 108;
 pub const SB_V_DOUBLE_ARROW: u16 = 116;
 pub const TOP_LEFT_ARROW: u16 = 132;
 pub const TOP_LEFT_CORNER: u16 = 134;
+pub const TOP_RIGHT_CORNER: u16 = 136;
 pub const XTERM: u16 = 152;
 
 pub struct XcbCursor {
@@ -317,6 +318,8 @@ impl CursorInfo {
             MouseCursor::Text => &["xterm"],
             MouseCursor::SizeUpDown => &["sb_v_double_arrow"],
             MouseCursor::SizeLeftRight => &["sb_h_double_arrow"],
+            MouseCursor::SizeNwSe => &["nwse-resize", "size_fdiag", "bottom_right_corner"],
+            MouseCursor::SizeNeSw => &["nesw-resize", "size_bdiag", "bottom_left_corner"],
         };
 
         let mut theme_list = vec![theme.to_string()];
@@ -376,6 +379,8 @@ impl CursorInfo {
             MouseCursor::Text => XTERM,
             MouseCursor::SizeUpDown => SB_V_DOUBLE_ARROW,
             MouseCursor::SizeLeftRight => SB_H_DOUBLE_ARROW,
+            MouseCursor::SizeNwSe => TOP_LEFT_CORNER,
+            MouseCursor::SizeNeSw => TOP_RIGHT_CORNER,
         };
         log::trace!("loading X11 basic cursor {} for {:?}", id_no, cursor);
 

@@ -27,4 +27,9 @@ pub struct Parameters {
     pub title_bar: TitleBar,
     /// If present, the application should draw it
     pub border_dimensions: Option<Border>,
+    /// When true, the window uses client-side decorations and the
+    /// windowing system expects the application to initiate interactive
+    /// resizes itself. The GUI responds by providing an internal resize
+    /// border that calls [`crate::WindowOps::request_drag_resize`].
+    pub client_side_resize: bool,
 }

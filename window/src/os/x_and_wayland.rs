@@ -9,8 +9,8 @@ use crate::os::x11::connection::XConnection;
 use crate::os::x11::window::XWindow;
 use crate::screen::Screens;
 use crate::{
-    Appearance, Clipboard, MouseCursor, Rect, RequestedWindowGeometry, ResizeIncrement,
-    ScreenPoint, WindowEvent, WindowOps,
+    Appearance, Clipboard, MouseCursor, Rect, RequestedWindowGeometry, ResizeEdge, ResizeIncrement,
+    ScreenPoint, WindowEvent, WindowOps, WindowState,
 };
 use async_trait::async_trait;
 use config::ConfigHandle;
@@ -367,6 +367,26 @@ impl WindowOps for Window {
             Self::X11(x) => x.request_drag_move(),
             #[cfg(feature = "wayland")]
             Self::Wayland(w) => w.request_drag_move(),
+        }
+    }
+
+    fn request_drag_resize(&self, edge: ResizeEdge) {
+        match self {
+            Self::X11(x) => x.request_drag_resize(edge),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(w) => w.request_drag_resize(edge),
+        }
+    }
+
+    fn get_os_parameters(
+        &self,
+        config: &ConfigHandle,
+        window_state: WindowState,
+    ) -> anyhow::Result<Option<crate::os::parameters::Parameters>> {
+        match self {
+            Self::X11(x) => x.get_os_parameters(config, window_state),
+            #[cfg(feature = "wayland")]
+            Self::Wayland(w) => w.get_os_parameters(config, window_state),
         }
     }
 

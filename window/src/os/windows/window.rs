@@ -1116,6 +1116,7 @@ impl WindowOps for Window {
                 right: BASE_BORDER,
                 color: top_border_color,
             }),
+            client_side_resize: false,
         }))
     }
 }
@@ -1799,6 +1800,8 @@ fn apply_mouse_cursor(cursor: Option<MouseCursor>) {
                     MouseCursor::Text => IDC_IBEAM,
                     MouseCursor::SizeUpDown => IDC_SIZENS,
                     MouseCursor::SizeLeftRight => IDC_SIZEWE,
+                    MouseCursor::SizeNwSe => IDC_SIZENWSE,
+                    MouseCursor::SizeNeSw => IDC_SIZENESW,
                 },
             ));
         },

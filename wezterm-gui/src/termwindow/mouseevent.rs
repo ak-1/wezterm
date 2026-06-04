@@ -3,7 +3,7 @@ use crate::termwindow::{
     GuiWin, MouseCapture, PositionedSplit, ScrollHit, TermWindowNotif, UIItem, UIItemType, TMB,
 };
 use ::window::{
-    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress,
+    MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress, ResizeEdge,
     WindowDecorations, WindowOps, WindowState,
 };
 use config::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnTabDomain};
@@ -56,6 +56,71 @@ impl super::TermWindow {
             | UIItemType::ScrollThumb
             | UIItemType::Split(_) => {}
         }
+    }
+
+    /// If the pointer is within the interactive resize border of a
+    /// client-side-decorated window, return the edge/corner it would resize.
+    /// Returns `None` when the backend doesn't want us to drive resizes, when
+    /// the window can't be resized (maximized/fullscreen), or when the pointer
+    /// isn't near a resizable edge. The top edge between the corners is left
+    /// alone so it remains available for the tab bar / window move.
+    fn resize_edge_for_event(&self, event: &MouseEvent) -> Option<ResizeEdge> {
+        if !self
+            .os_parameters
+            .as_ref()
+            .map_or(false, |p| p.client_side_resize)
+        {
+            return None;
+        }
+        if !self.window_state.can_resize() {
+            return None;
+        }
+
+        let w = self.dimensions.pixel_width as isize;
+        let h = self.dimensions.pixel_height as isize;
+        if w <= 0 || h <= 0 {
+            return None;
+        }
+
+        // Scale the hit zones with the display so they stay usable on HiDPI.
+        let scale = (self.dimensions.dpi as f32 / 96.0).max(1.0);
+        let border = (6.0 * scale).round() as isize;
+        let corner = (16.0 * scale).round() as isize;
+
+        let x = event.coords.x;
+        let y = event.coords.y;
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return None;
+        }
+
+        let left = x < border;
+        let right = x >= w - border;
+        let top = y < border;
+        let bottom = y >= h - border;
+        let near_left = x < corner;
+        let near_right = x >= w - corner;
+        let near_top = y < corner;
+        let near_bottom = y >= h - corner;
+
+        let edge = if (left && near_top) || (top && near_left) {
+            ResizeEdge::TopLeft
+        } else if (right && near_top) || (top && near_right) {
+            ResizeEdge::TopRight
+        } else if (left && near_bottom) || (bottom && near_left) {
+            ResizeEdge::BottomLeft
+        } else if (right && near_bottom) || (bottom && near_right) {
+            ResizeEdge::BottomRight
+        } else if left {
+            ResizeEdge::Left
+        } else if right {
+            ResizeEdge::Right
+        } else if bottom {
+            ResizeEdge::Bottom
+        } else {
+            // The top edge (between the corners) is reserved for the tab bar.
+            return None;
+        };
+        Some(edge)
     }
 
     pub fn mouse_event_impl(&mut self, event: MouseEvent, context: &dyn WindowOps) {
@@ -118,6 +183,30 @@ impl super::TermWindow {
         }
 
         self.last_mouse_coords = (x, y);
+
+        // Client-side-decorated windows (notably Wayland) must initiate their
+        // own interactive resizes. Provide a comfortable resize border around
+        // the window edges/corners that hands off to the compositor. We only
+        // do this when no drag or capture is already in progress so that
+        // selections and UI drags that reach the edge are not hijacked.
+        if self.current_mouse_capture.is_none()
+            && self.window_drag_position.is_none()
+            && self.dragging.is_none()
+        {
+            if let Some(edge) = self.resize_edge_for_event(&event) {
+                match &event.kind {
+                    WMEK::Move => {
+                        context.set_cursor(Some(resize_edge_cursor(edge)));
+                        return;
+                    }
+                    WMEK::Press(MousePress::Left) => {
+                        context.request_drag_resize(edge);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         let mut capture_mouse = false;
 
@@ -1049,5 +1138,14 @@ fn mouse_press_to_tmb(press: &MousePress) -> TMB {
         MousePress::Left => TMB::Left,
         MousePress::Right => TMB::Right,
         MousePress::Middle => TMB::Middle,
+    }
+}
+
+fn resize_edge_cursor(edge: ResizeEdge) -> MouseCursor {
+    match edge {
+        ResizeEdge::Top | ResizeEdge::Bottom => MouseCursor::SizeUpDown,
+        ResizeEdge::Left | ResizeEdge::Right => MouseCursor::SizeLeftRight,
+        ResizeEdge::TopLeft | ResizeEdge::BottomRight => MouseCursor::SizeNwSe,
+        ResizeEdge::TopRight | ResizeEdge::BottomLeft => MouseCursor::SizeNeSw,
     }
 }
