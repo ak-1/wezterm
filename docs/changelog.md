@@ -73,6 +73,12 @@ As features stabilize some brief notes about them will accumulate here.
 * windows: Improve detection of running in WSL. Thanks to @bew! #7137
 
 #### New
+* [PasteImageFrom](config/lua/keyassignment/PasteImageFrom.md) key assignment:
+  pastes a clipboard image by writing it to a temp file on the pane's host and
+  pasting that path, so path-aware tools (e.g. Claude Code) can load images even
+  when attached to a remote multiplexer (`wezterm connect SSHMUX:*`). Delivery
+  rides the multiplexer protocol; clipboard image reading is currently Wayland
+  only. Related to the broader cross-platform proposal in #7624 / #7272.
 * [wezterm.serde](config/lua/wezterm.serde/index.md) module for serialization
   and deserialization of JSON, TOML and YAML. Thanks to @expnn! #4969
 * `wezterm ssh` now supports agent forwarding. Thanks to @Riatre! #5345
