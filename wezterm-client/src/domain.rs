@@ -635,13 +635,14 @@ impl ClientDomain {
 
                 if let Some(local_window_id) = primary_window_id {
                     // Verify that the workspace is consistent between the local and remote
-                    // windows
-                    if Some(
-                        mux.get_window(local_window_id)
-                            .expect("primary window to be valid")
-                            .get_workspace(),
-                    ) == workspace.as_deref()
-                    {
+                    // windows. The primary window may be absent from the mux (for example
+                    // when GUI window creation failed); treat that like a workspace mismatch
+                    // and fall through to making a new window rather than panicking.
+                    let can_reuse = match mux.get_window(local_window_id) {
+                        Some(window) => Some(window.get_workspace()) == workspace.as_deref(),
+                        None => false,
+                    };
+                    if can_reuse {
                         // Yes! We can use this window
                         log::debug!(
                             "adding remote window {} as tab to local window {}",
