@@ -127,7 +127,16 @@ impl PendingMouse {
                 changed
             }
             PointerEventKind::Motion { .. } => {
-                let changed = self.surface_coords.is_none();
+                // Receiving motion means the pointer is over our surface, so
+                // re-assert that we're in the window. After an interactive move
+                // (xdg_toplevel.move) the compositor sends a `leave` when the
+                // grab starts but does not always send a matching `enter` when
+                // it ends (notably mutter); without this the window stays stuck
+                // in the "left" state, which suppresses cursor updates (see
+                // set_cursor) and makes dispatch_pending_mouse emit a spurious
+                // MouseLeave after every motion.
+                let changed = self.surface_coords.is_none() || !self.in_window;
+                self.in_window = true;
                 self.surface_coords.replace(evt.position);
                 changed
             }

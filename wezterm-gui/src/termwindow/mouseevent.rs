@@ -247,8 +247,34 @@ impl super::TermWindow {
             }
 
             WMEK::Move => {
-                if let Some(start) = self.window_drag_position.as_ref() {
-                    // Dragging the window
+                if self.window_drag_position.is_some() {
+                    let compositor_driven_move = self
+                        .os_parameters
+                        .as_ref()
+                        .map_or(false, |p| p.compositor_driven_move);
+                    if compositor_driven_move {
+                        // The compositor owns the interactive move (Wayland's
+                        // xdg_toplevel.move). Kick it off on the first drag
+                        // motion -- not eagerly on the press, which would hand
+                        // the pointer to the move grab immediately and break
+                        // click / double-click handling on the tab bar (e.g.
+                        // double-click to maximize). Once handed off we will not
+                        // receive the button release that ends the move, so drop
+                        // our drag/capture state now; otherwise every later
+                        // motion would re-enter this branch (re-initiating the
+                        // move) and short-circuit cursor and hover handling until
+                        // some other click delivered a release.
+                        context.request_drag_move();
+                        self.window_drag_position.take();
+                        self.current_mouse_capture = None;
+                        self.current_mouse_buttons.clear();
+                        return;
+                    }
+
+                    // Client-driven move (Windows, macOS): we reposition the
+                    // window ourselves on each motion and rely on the eventual
+                    // mouse-release to end the drag.
+                    let start = self.window_drag_position.as_ref().unwrap();
                     // Compute the distance since the initial event
                     let delta_x = start.screen_coords.x - event.screen_coords.x;
                     let delta_y = start.screen_coords.y - event.screen_coords.y;
@@ -265,17 +291,6 @@ impl super::TermWindow {
                     );
                     // and now tell the window to go there
                     context.set_window_position(top_left);
-                    // On Wayland (and X11) the window manager owns the window
-                    // position, so `set_window_position` is a no-op and the move
-                    // must instead be driven by the compositor. Initiate that
-                    // interactive move here, on the first drag motion, rather
-                    // than eagerly on the initial press: starting it on press
-                    // hands the pointer to the compositor's move grab, which
-                    // swallows the rest of the click sequence and breaks click /
-                    // double-click handling on the tab bar (e.g. double-click to
-                    // maximize). `request_drag_move` is a no-op on platforms that
-                    // move via `set_window_position` (Windows, macOS).
-                    context.request_drag_move();
                     return;
                 }
 

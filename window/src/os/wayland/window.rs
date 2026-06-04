@@ -583,6 +583,10 @@ impl WindowOps for WaylandWindow {
             title_bar: Default::default(),
             border_dimensions: None,
             client_side_resize,
+            // On Wayland an interactive move is driven by the compositor via
+            // xdg_toplevel.move; once we issue it we won't see the button
+            // release, so the GUI must drop its drag state immediately.
+            compositor_driven_move: true,
         }))
     }
 

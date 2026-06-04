@@ -32,4 +32,13 @@ pub struct Parameters {
     /// resizes itself. The GUI responds by providing an internal resize
     /// border that calls [`crate::WindowOps::request_drag_resize`].
     pub client_side_resize: bool,
+    /// When true, an interactive window move (`request_drag_move`) is owned by
+    /// the compositor/window manager once started: the application hands off
+    /// the pointer and will *not* receive the button release that ends the
+    /// move. The GUI must therefore stop tracking the drag itself as soon as it
+    /// kicks one off, rather than waiting for a release. This is the case on
+    /// Wayland (`xdg_toplevel.move`). When false (Windows, macOS) the move is
+    /// driven by the application via repeated `set_window_position` calls and
+    /// the drag state is cleared by the eventual mouse-release.
+    pub compositor_driven_move: bool,
 }

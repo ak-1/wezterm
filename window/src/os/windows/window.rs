@@ -1117,6 +1117,7 @@ impl WindowOps for Window {
                 color: top_border_color,
             }),
             client_side_resize: false,
+            compositor_driven_move: false,
         }))
     }
 }
