@@ -531,6 +531,13 @@ impl WindowOps for WaylandWindow {
         WaylandConnection::with_window_inner(self.0, move |inner| Ok(inner.restore()));
     }
 
+    fn request_drag_move(&self) {
+        WaylandConnection::with_window_inner(self.0, move |inner| {
+            inner.request_drag_move();
+            Ok(())
+        });
+    }
+
     fn config_did_change(&self, config: &ConfigHandle) {
         let config = config.clone();
         WaylandConnection::with_window_inner(self.0, move |inner| {
@@ -1325,6 +1332,28 @@ impl WaylandWindowInner {
     fn restore(&mut self) {
         if let Some(window) = self.window.as_mut() {
             window.unset_maximized();
+        }
+    }
+
+    /// Ask the compositor to begin an interactive move of this window.
+    /// On Wayland the compositor owns the drag once `xdg_toplevel.move` is
+    /// issued, so (unlike X11) we don't track the pointer ourselves and
+    /// `set_window_drag_position` is intentionally a no-op.
+    fn request_drag_move(&self) {
+        let window = match self.window.as_ref() {
+            Some(window) => window,
+            None => return,
+        };
+        let conn = Connection::get().unwrap().wayland();
+        let state = conn.wayland_state.borrow();
+        let serial = *state.last_serial.borrow();
+        match state.pointer.as_ref() {
+            Some(pointer) => {
+                if let Some(pdata) = pointer.pointer().data::<PointerUserData>() {
+                    window.move_(pdata.pdata.seat(), serial);
+                }
+            }
+            None => log::warn!("request_drag_move: no pointer to drive the move"),
         }
     }
 
