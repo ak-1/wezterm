@@ -1160,6 +1160,12 @@ impl WaylandWindowInner {
     }
 
     fn set_text_cursor_position(&mut self, rect: Rect) {
+        if self.window.is_none() {
+            // We're likely in the middle of creating or closing/destroying
+            // the window; there's no surface to position the cursor against.
+            return;
+        }
+
         let conn = WaylandConnection::get().unwrap().wayland();
         let state = conn.wayland_state.borrow();
         let surface = self.surface().clone();
