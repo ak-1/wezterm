@@ -8,18 +8,22 @@ WezTerm is a GPU-accelerated, cross-platform terminal emulator and multiplexer w
 
 ## Build, test, lint
 
-This is a large Cargo workspace. Use the `Makefile` targets, which encode the canonical invocations:
+This is a large Cargo workspace. Use the `Makefile` targets (or the equivalent `justfile` recipes — see below), which encode the canonical invocations:
 
 - `make build` — builds the four shipped binaries: `wezterm` (CLI/client), `wezterm-gui`, `wezterm-mux-server`, `strip-ansi-escapes`.
 - `make check` / `cargo check` — fast type-check loop; preferred for iterating before a full build.
 - `make test` — runs `cargo nextest run`, then re-runs `-p wezterm-escape-parser` separately because that crate is `no_std` by default.
 - `make fmt` — **must** be run with the nightly toolchain (`cargo +nightly fmt`); CI rejects unformatted code. The repo uses `imports_granularity = "Module"` (a nightly-only rustfmt option).
 
+The repo also ships a `justfile` mirroring these as `just`-friendly recipes (`just check`, `just build`, `just test`, `just fmt`, `just run`, `just clippy`, …). Run `just --list` to see them. There are also `just test-one <name>` for a single test and Nix recipes (`just nix-build`, `just nix-shell`).
+
 Run a single test: `cargo nextest run -p <crate> <test_name_substring>` (or `cargo test -p <crate> <name>` if nextest isn't installed).
 
 First-time setup needs system libraries and git submodules:
 - `git submodule update --init --recursive` (vendored harfbuzz, freetype, libpng, zlib under `deps/`).
 - `./get-deps` installs OS packages (translate new OS-specific install steps into this script rather than into docs).
+
+On Nix/NixOS, skip `./get-deps` and use the pinned dev shell instead: `nix develop 'git+file:.?dir=nix'` (or `just nix-shell`). The flake under `nix/` provides pkg-config and the X11/Wayland/xcb/font dev libraries; building outside this shell fails to find them (`x11.pc`, `openssl`, etc.). `just nix-build` / `just nix-build-headless` build the GUI / headless packages via the flake.
 
 Docs: `ci/build-docs.sh serve` builds and live-reloads the site locally.
 
