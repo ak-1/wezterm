@@ -169,6 +169,21 @@ pub struct Config {
     #[dynamic(default = "default_command_palette_bg_color")]
     pub command_palette_bg_color: RgbaColor,
 
+    /// Color used to render the keyboard shortcut/key assignment associated
+    /// with each command palette entry
+    #[dynamic(default = "default_command_palette_key_color")]
+    pub command_palette_key_color: RgbaColor,
+
+    /// Color used to highlight the portions of the label that match the
+    /// current command palette filter text
+    #[dynamic(default = "default_command_palette_match_color")]
+    pub command_palette_match_color: RgbaColor,
+
+    /// Selects the default matching behavior of the command palette filter.
+    /// Can be toggled at runtime with CTRL-R while the palette is open.
+    #[dynamic(default)]
+    pub command_palette_match_mode: CommandPaletteMatchMode,
+
     /// Font to use for PaneSelect
     #[dynamic(default)]
     pub pane_select_font: Option<TextStyle>,
@@ -1655,6 +1670,14 @@ fn default_command_palette_bg_color() -> RgbaColor {
     (0x33, 0x33, 0x33).into()
 }
 
+fn default_command_palette_key_color() -> RgbaColor {
+    SrgbaTuple(0.5, 0.65, 0.95, 1.0).into()
+}
+
+fn default_command_palette_match_color() -> RgbaColor {
+    SrgbaTuple(0.95, 0.6, 0.25, 1.0).into()
+}
+
 fn default_swallow_mouse_click_on_window_focus() -> bool {
     cfg!(target_os = "macos")
 }
@@ -2038,6 +2061,17 @@ pub enum ExitBehaviorMessaging {
     Brief,
     Terse,
     None,
+}
+
+#[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CommandPaletteMatchMode {
+    /// Fuzzy subsequence matching (the historical default). Multiple
+    /// whitespace-separated words are matched as independent fuzzy atoms.
+    #[default]
+    Fuzzy,
+    /// Each whitespace-separated word must occur verbatim (case-insensitively)
+    /// somewhere in the entry, in any order.
+    Exact,
 }
 
 #[derive(Debug, FromDynamic, ToDynamic, Clone, Copy, PartialEq, Eq)]

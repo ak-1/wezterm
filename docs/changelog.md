@@ -73,6 +73,14 @@ As features stabilize some brief notes about them will accumulate here.
 * windows: Improve detection of running in WSL. Thanks to @bew! #7137
 
 #### New
+* The command palette now supports `PageUp`/`PageDown` navigation, renders the
+  key assignment for each entry in a distinct color
+  ([command_palette_key_color](config/lua/config/command_palette_key_color.md)),
+  and offers an exact/multi-part matching mode in addition to fuzzy matching.
+  The default mode is set via
+  [command_palette_match_mode](config/lua/config/command_palette_match_mode.md)
+  and can be toggled at runtime with `CTRL-R`; matched text is highlighted using
+  [command_palette_match_color](config/lua/config/command_palette_match_color.md).
 * [PasteImageFrom](config/lua/keyassignment/PasteImageFrom.md) key assignment:
   pastes a clipboard image by writing it to a temp file on the pane's host and
   pasting that path, so path-aware tools (e.g. Claude Code) can load images even
