@@ -278,6 +278,7 @@ fn pane_tree(
                 left_col,
                 top_row,
                 tty_name: pane.tty_name(),
+                pid: pane.process_pid(),
             })
         }
     }
@@ -2161,6 +2162,7 @@ pub struct PaneEntry {
     pub top_row: usize,
     pub left_col: usize,
     pub tty_name: Option<String>,
+    pub pid: Option<u32>,
 }
 
 #[derive(Deserialize, Clone, Serialize, PartialEq, Debug)]

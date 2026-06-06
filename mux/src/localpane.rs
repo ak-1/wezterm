@@ -530,6 +530,13 @@ impl Pane for LocalPane {
         }
     }
 
+    fn process_pid(&self) -> Option<u32> {
+        match &*self.process.lock() {
+            ProcessState::Running { pid, .. } => *pid,
+            ProcessState::DeadPendingClose { .. } | ProcessState::Dead => None,
+        }
+    }
+
     fn get_foreground_process_info(&self, policy: CachePolicy) -> Option<LocalProcessInfo> {
         #[cfg(unix)]
         if let Some(pid) = self.pty.lock().process_group_leader() {

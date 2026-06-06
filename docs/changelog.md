@@ -55,6 +55,9 @@ As features stabilize some brief notes about them will accumulate here.
 * macOS: The wezterm terminfo file is now compiled and bundled in the
   application bundle. Thanks to @ddeville! #6538
 * `wezterm record` now has a `-o outputfile` option. Thanks to @Tyarel8! #6626
+* `wezterm cli list --format json` now includes a `pid` field reporting the
+  process id of the program spawned into each pane (the equivalent of tmux's
+  `pane_pid`), for panes hosted by the mux you are directly connected to.
 * `ShowTabNavigator` now defaults to selecting the active tab. Thanks to
   @mgpinf! #6320
 * macOS: toast notifications now use UNUserNotificationCenter. This requires

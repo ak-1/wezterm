@@ -139,6 +139,10 @@ struct CliListResultItem {
     is_active: bool,
     is_zoomed: bool,
     tty_name: Option<String>,
+    /// The process id of the program spawned into the pane (tmux's `pane_pid`),
+    /// if known. Only populated for panes whose process runs on the mux we are
+    /// directly connected to.
+    pid: Option<u32>,
 }
 
 impl CliListResultItem {
@@ -157,6 +161,7 @@ impl CliListResultItem {
             is_active_pane,
             is_zoomed_pane,
             tty_name,
+            pid,
             size:
                 TerminalSize {
                     rows,
@@ -197,6 +202,7 @@ impl CliListResultItem {
             is_active: is_active_pane,
             is_zoomed: is_zoomed_pane,
             tty_name,
+            pid,
         }
     }
 }
