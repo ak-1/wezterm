@@ -357,6 +357,14 @@ pub trait Pane: Downcast + Send + Sync {
         None
     }
 
+    /// Returns the process id of the program that was spawned into this pane
+    /// (the equivalent of tmux's `pane_pid`), if it is known and still alive.
+    /// This is the stable session-leader pid, not the current foreground
+    /// process; use `get_foreground_process_info` for the latter.
+    fn process_pid(&self) -> Option<u32> {
+        None
+    }
+
     fn exit_behavior(&self) -> Option<ExitBehavior> {
         None
     }
