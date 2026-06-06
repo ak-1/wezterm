@@ -1,5 +1,5 @@
 use crate::commands::{CommandDef, ExpandedCommand};
-use crate::overlay::selector::{matcher_pattern, matcher_score};
+use crate::overlay::selector::{matcher_indices, matcher_pattern, matcher_score};
 use crate::termwindow::box_model::*;
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::corners::{
@@ -9,7 +9,7 @@ use crate::termwindow::render::corners::{
 use crate::termwindow::{DimensionContext, GuiWin, TermWindow};
 use crate::utilsprites::RenderMetrics;
 use config::keyassignment::KeyAssignment;
-use config::Dimension;
+use config::{CommandPaletteMatchMode, Dimension};
 use frecency::Frecency;
 use luahelper::{from_lua_value_dynamic, impl_lua_conversion_dynamic};
 use mux_lua::MuxPane;
@@ -20,20 +20,24 @@ use std::cell::{Ref, RefCell};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use termwiz::nerdfonts::NERD_FONTS;
 use wezterm_dynamic::{FromDynamic, ToDynamic};
+use wezterm_font::LoadedFont;
 use wezterm_term::{KeyCode, KeyModifiers, MouseEvent};
 use window::color::LinearRgba;
 use window::Modifiers;
 
 struct MatchResults {
     selection: String,
+    mode: CommandPaletteMatchMode,
     matches: Vec<usize>,
 }
 
 pub struct CommandPalette {
     element: RefCell<Option<Vec<ComputedElement>>>,
     selection: RefCell<String>,
+    mode: RefCell<CommandPaletteMatchMode>,
     matches: RefCell<Option<MatchResults>>,
     selected_row: RefCell<usize>,
     top_row: RefCell<usize>,
@@ -191,28 +195,234 @@ impl MatchResult {
     }
 }
 
-fn compute_matches(selection: &str, commands: &[ExpandedCommand]) -> Vec<usize> {
-    if selection.is_empty() {
-        commands.iter().enumerate().map(|(idx, _)| idx).collect()
+/// The text that is displayed for a command palette entry (the icon and the
+/// key assignment are rendered separately). Highlighting and exact matching
+/// operate on this same string so that the highlighted ranges line up with
+/// what the user sees.
+fn entry_label(command: &ExpandedCommand) -> String {
+    let group = if command.menubar.is_empty() {
+        String::new()
     } else {
-        let pattern = matcher_pattern(selection);
+        format!("{}: ", command.menubar.join(" | "))
+    };
 
-        let start = std::time::Instant::now();
-        let mut scores: Vec<MatchResult> = commands
-            .par_iter()
-            .enumerate()
-            .filter_map(|(row_idx, entry)| {
-                let group = entry.menubar.join(" ");
-                let text = format!("{group}: {}. {} {:?}", entry.brief, entry.doc, entry.action);
-                matcher_score(&pattern, &text)
-                    .map(|score| MatchResult::new(row_idx, score, selection, commands))
-            })
-            .collect();
-        scores.sort_by(|a, b| a.score.cmp(&b.score).reverse());
-        log::trace!("matching took {:?}", start.elapsed());
-
-        scores.iter().map(|result| result.row_idx).collect()
+    // DRY if the brief and doc are the same
+    if command.doc.is_empty()
+        || command.brief.to_ascii_lowercase() == command.doc.to_ascii_lowercase()
+    {
+        format!("{group}{}", command.brief)
+    } else {
+        format!("{group}{}. {}", command.brief, command.doc)
     }
+}
+
+fn compute_matches(
+    selection: &str,
+    commands: &[ExpandedCommand],
+    mode: CommandPaletteMatchMode,
+) -> Vec<usize> {
+    if selection.is_empty() {
+        return commands.iter().enumerate().map(|(idx, _)| idx).collect();
+    }
+
+    match mode {
+        CommandPaletteMatchMode::Fuzzy => {
+            let pattern = matcher_pattern(selection);
+
+            let start = std::time::Instant::now();
+            let mut scores: Vec<MatchResult> = commands
+                .par_iter()
+                .enumerate()
+                .filter_map(|(row_idx, entry)| {
+                    let group = entry.menubar.join(" ");
+                    let text =
+                        format!("{group}: {}. {} {:?}", entry.brief, entry.doc, entry.action);
+                    matcher_score(&pattern, &text)
+                        .map(|score| MatchResult::new(row_idx, score, selection, commands))
+                })
+                .collect();
+            scores.sort_by(|a, b| a.score.cmp(&b.score).reverse());
+            log::trace!("fuzzy matching took {:?}", start.elapsed());
+
+            scores.iter().map(|result| result.row_idx).collect()
+        }
+        CommandPaletteMatchMode::Exact => {
+            // Each whitespace-separated part must appear (case-insensitively)
+            // somewhere in the label, but the parts may appear in any order.
+            // The pre-existing ordering of `commands` (frecency, then menu
+            // position) is preserved.
+            let parts: Vec<String> = selection
+                .split_whitespace()
+                .map(|p| p.to_lowercase())
+                .collect();
+
+            commands
+                .iter()
+                .enumerate()
+                .filter_map(|(row_idx, entry)| {
+                    let label = entry_label(entry).to_lowercase();
+                    if parts.iter().all(|part| label.contains(part.as_str())) {
+                        Some(row_idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+    }
+}
+
+/// Returns whether two characters are equal when compared case-insensitively.
+fn char_eq_ignore_case(a: char, b: char) -> bool {
+    a == b || a.eq_ignore_ascii_case(&b) || a.to_lowercase().eq(b.to_lowercase())
+}
+
+/// Find all non-overlapping byte ranges within `label` where `needle` occurs
+/// case-insensitively.
+fn find_ci_ranges(label: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return vec![];
+    }
+    let label_chars: Vec<(usize, char)> = label.char_indices().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let mut ranges = vec![];
+    let mut i = 0;
+    while i + needle_chars.len() <= label_chars.len() {
+        let is_match = needle_chars
+            .iter()
+            .enumerate()
+            .all(|(k, &nc)| char_eq_ignore_case(label_chars[i + k].1, nc));
+        if is_match {
+            let start = label_chars[i].0;
+            let last = i + needle_chars.len() - 1;
+            let end = label_chars[last].0 + label_chars[last].1.len_utf8();
+            ranges.push((start, end));
+            i += needle_chars.len();
+        } else {
+            i += 1;
+        }
+    }
+    ranges
+}
+
+/// Convert a sorted/de-duplicated list of *character* indices into contiguous
+/// byte ranges within `label`, coalescing adjacent characters.
+fn char_indices_to_byte_ranges(label: &str, char_indices: &[u32]) -> Vec<(usize, usize)> {
+    let offsets: Vec<(usize, usize)> = label
+        .char_indices()
+        .map(|(b, c)| (b, c.len_utf8()))
+        .collect();
+    let chars: Vec<usize> = char_indices
+        .iter()
+        .map(|&c| c as usize)
+        .filter(|&c| c < offsets.len())
+        .collect();
+    let mut ranges = vec![];
+    let mut k = 0;
+    while k < chars.len() {
+        let start_char = chars[k];
+        let mut end_char = start_char;
+        while k + 1 < chars.len() && chars[k + 1] == end_char + 1 {
+            end_char = chars[k + 1];
+            k += 1;
+        }
+        let (start_byte, _) = offsets[start_char];
+        let (end_byte, end_len) = offsets[end_char];
+        ranges.push((start_byte, end_byte + end_len));
+        k += 1;
+    }
+    ranges
+}
+
+/// Merge overlapping/adjacent byte ranges into a sorted, non-overlapping list.
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_by_key(|r| r.0);
+    let mut out: Vec<(usize, usize)> = vec![];
+    for (s, e) in ranges {
+        if let Some(last) = out.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
+                continue;
+            }
+        }
+        out.push((s, e));
+    }
+    out
+}
+
+/// Compute the byte ranges within `label` that should be highlighted for the
+/// given `selection` and match `mode`.
+fn highlight_byte_ranges(
+    label: &str,
+    selection: &str,
+    mode: CommandPaletteMatchMode,
+) -> Vec<(usize, usize)> {
+    if selection.trim().is_empty() {
+        return vec![];
+    }
+    match mode {
+        CommandPaletteMatchMode::Exact => {
+            let mut ranges = vec![];
+            for part in selection.split_whitespace() {
+                ranges.extend(find_ci_ranges(label, part));
+            }
+            merge_ranges(ranges)
+        }
+        CommandPaletteMatchMode::Fuzzy => {
+            let pattern = matcher_pattern(selection);
+            match matcher_indices(&pattern, label) {
+                Some(char_indices) => char_indices_to_byte_ranges(label, &char_indices),
+                None => vec![],
+            }
+        }
+    }
+}
+
+/// Split `label` into inline elements, coloring the highlighted ranges with
+/// `match_color` and leaving the remainder to inherit the row's text color.
+fn build_label_spans(
+    font: &Rc<LoadedFont>,
+    label: &str,
+    ranges: &[(usize, usize)],
+    match_color: &InheritableColor,
+) -> Vec<Element> {
+    if ranges.is_empty() {
+        return vec![Element::new(font, ElementContent::Text(label.to_string()))];
+    }
+
+    let mut spans = vec![];
+    let mut pos = 0;
+    for &(start, end) in ranges {
+        let start = start.min(label.len());
+        let end = end.min(label.len());
+        if start <= pos {
+            // Already consumed by a prior (merged) range
+        } else {
+            spans.push(Element::new(
+                font,
+                ElementContent::Text(label[pos..start].to_string()),
+            ));
+        }
+        if end > start {
+            spans.push(
+                Element::new(font, ElementContent::Text(label[start..end].to_string())).colors(
+                    ElementColors {
+                        border: BorderColor::default(),
+                        bg: InheritableColor::Inherited,
+                        text: match_color.clone(),
+                    },
+                ),
+            );
+        }
+        pos = pos.max(end);
+    }
+    if pos < label.len() {
+        spans.push(Element::new(
+            font,
+            ElementContent::Text(label[pos..].to_string()),
+        ));
+    }
+    spans
 }
 
 impl CommandPalette {
@@ -237,6 +447,7 @@ impl CommandPalette {
         Self {
             element: RefCell::new(None),
             selection: RefCell::new(String::new()),
+            mode: RefCell::new(term_window.config.command_palette_match_mode),
             commands,
             matches: RefCell::new(None),
             selected_row: RefCell::new(0),
@@ -250,6 +461,7 @@ impl CommandPalette {
         selection: &str,
         commands: &[ExpandedCommand],
         matches: &MatchResults,
+        mode: CommandPaletteMatchMode,
         max_rows_on_screen: usize,
         selected_row: usize,
         top_row: usize,
@@ -269,20 +481,51 @@ impl CommandPalette {
         let border = term_window.get_os_border();
         let top_pixel_y = top_bar_height + padding_top + border.top.get() as f32;
 
-        let mut elements =
-            vec![
-                Element::new(&font, ElementContent::Text(format!("> {selection}_")))
-                    .colors(ElementColors {
-                        border: BorderColor::default(),
-                        bg: LinearRgba::TRANSPARENT.into(),
-                        text: term_window
-                            .config
-                            .command_palette_fg_color
-                            .to_linear()
-                            .into(),
-                    })
-                    .display(DisplayType::Block),
-            ];
+        let fg_color: InheritableColor = term_window
+            .config
+            .command_palette_fg_color
+            .to_linear()
+            .into();
+        let key_color: InheritableColor = term_window
+            .config
+            .command_palette_key_color
+            .to_linear()
+            .into();
+        let match_color: InheritableColor = term_window
+            .config
+            .command_palette_match_color
+            .to_linear()
+            .into();
+
+        // The input line, with a right-aligned indicator showing the active
+        // match mode and the key to toggle it.
+        let mode_label = match mode {
+            CommandPaletteMatchMode::Fuzzy => "fuzzy match",
+            CommandPaletteMatchMode::Exact => "exact match",
+        };
+        let mut elements = vec![Element::new(
+            &font,
+            ElementContent::Children(vec![
+                Element::new(&font, ElementContent::Text(format!("> {selection}_"))),
+                Element::new(
+                    &font,
+                    ElementContent::Text(format!("{mode_label}   ^R to toggle")),
+                )
+                .float(Float::Right)
+                .colors(ElementColors {
+                    border: BorderColor::default(),
+                    bg: LinearRgba::TRANSPARENT.into(),
+                    text: key_color.clone(),
+                }),
+            ]),
+        )
+        .colors(ElementColors {
+            border: BorderColor::default(),
+            bg: LinearRgba::TRANSPARENT.into(),
+            text: fg_color.clone(),
+        })
+        .min_width(Some(Dimension::Percent(1.)))
+        .display(DisplayType::Block)];
 
         for (display_idx, command) in matches
             .matches
@@ -292,12 +535,6 @@ impl CommandPalette {
             .skip(top_row)
             .take(max_rows_on_screen)
         {
-            let group = if command.menubar.is_empty() {
-                String::new()
-            } else {
-                format!("{}: ", command.menubar.join(" | "))
-            };
-
             let icon = match &command.icon {
                 Some(nf) => NERD_FONTS.get(nf.as_ref()).unwrap_or_else(|| {
                     log::error!("nerdfont {nf} not found in NERD_FONTS");
@@ -323,26 +560,18 @@ impl CommandPalette {
                 (LinearRgba::TRANSPARENT.into(), solid_fg_color.clone())
             };
 
-            let (label_bg, label_text) = if display_idx == selected_row {
-                (solid_fg_color.clone(), solid_bg_color.clone())
+            let label_bg = if display_idx == selected_row {
+                solid_fg_color.clone()
             } else {
-                (solid_bg_color.clone(), solid_fg_color.clone())
+                solid_bg_color.clone()
             };
 
-            // DRY if the brief and doc are the same
-            let label = if command.doc.is_empty()
-                || command.brief.to_ascii_lowercase() == command.doc.to_ascii_lowercase()
-            {
-                format!("{group}{}", command.brief)
-            } else {
-                format!("{group}{}. {}", command.brief, command.doc)
-            };
+            let label = entry_label(command);
+            let ranges = highlight_byte_ranges(&label, selection, mode);
 
-            let mut row = vec![
-                Element::new(&font, ElementContent::Text(icon.to_string()))
-                    .min_width(Some(Dimension::Cells(2.))),
-                Element::new(&font, ElementContent::Text(label)),
-            ];
+            let mut row = vec![Element::new(&font, ElementContent::Text(icon.to_string()))
+                .min_width(Some(Dimension::Cells(2.)))];
+            row.extend(build_label_spans(&font, &label, &ranges, &match_color));
 
             if !command.keys.is_empty() {
                 let mut keys = command.keys.clone();
@@ -416,8 +645,8 @@ impl CommandPalette {
                         .zindex(10)
                         .colors(ElementColors {
                             border: BorderColor::default(),
-                            bg: label_bg.clone(),
-                            text: label_text.clone(),
+                            bg: label_bg,
+                            text: key_color.clone(),
                         }),
                 );
             }
@@ -544,31 +773,56 @@ impl CommandPalette {
         *self.top_row.borrow_mut() = 0;
     }
 
-    fn move_up(&self) {
-        let mut row = self.selected_row.borrow_mut();
-        *row = row.saturating_sub(1);
-
-        let mut top_row = self.top_row.borrow_mut();
-        if *row < *top_row {
-            *top_row = *row;
-        }
-    }
-
-    fn move_down(&self) {
-        let max_rows_on_screen = *self.max_rows_on_screen.borrow();
-        let limit = self
-            .matches
+    fn match_limit(&self) -> usize {
+        self.matches
             .borrow()
             .as_ref()
             .map(|m| m.matches.len())
             .unwrap_or_else(|| self.commands.len())
-            .saturating_sub(1);
+            .saturating_sub(1)
+    }
+
+    fn move_up(&self) {
+        self.move_by(-1);
+    }
+
+    fn move_down(&self) {
+        self.move_by(1);
+    }
+
+    fn move_page_up(&self) {
+        let page = (*self.max_rows_on_screen.borrow()).max(1) as isize;
+        self.move_by(-page);
+    }
+
+    fn move_page_down(&self) {
+        let page = (*self.max_rows_on_screen.borrow()).max(1) as isize;
+        self.move_by(page);
+    }
+
+    fn move_by(&self, delta: isize) {
+        let max_rows_on_screen = (*self.max_rows_on_screen.borrow()).max(1);
+        let limit = self.match_limit();
         let mut row = self.selected_row.borrow_mut();
-        *row = row.saturating_add(1).min(limit);
+        *row = (*row as isize + delta).max(0).min(limit as isize) as usize;
+
         let mut top_row = self.top_row.borrow_mut();
-        if *row > *top_row + max_rows_on_screen - 1 {
+        if *row < *top_row {
+            *top_row = *row;
+        } else if *row > *top_row + max_rows_on_screen - 1 {
             *top_row = row.saturating_sub(max_rows_on_screen - 1);
         }
+    }
+
+    fn toggle_mode(&self) {
+        let mut mode = self.mode.borrow_mut();
+        *mode = match *mode {
+            CommandPaletteMatchMode::Fuzzy => CommandPaletteMatchMode::Exact,
+            CommandPaletteMatchMode::Exact => CommandPaletteMatchMode::Fuzzy,
+        };
+        // Force the match set to be recomputed for the new mode.
+        self.matches.borrow_mut().take();
+        self.updated_input();
     }
 }
 
@@ -600,6 +854,16 @@ impl Modal for CommandPalette {
             }
             (KeyCode::DownArrow, KeyModifiers::NONE) | (KeyCode::Char('n'), KeyModifiers::CTRL) => {
                 self.move_down();
+            }
+            (KeyCode::PageUp, KeyModifiers::NONE) => {
+                self.move_page_up();
+            }
+            (KeyCode::PageDown, KeyModifiers::NONE) => {
+                self.move_page_down();
+            }
+            (KeyCode::Char('r'), KeyModifiers::CTRL) => {
+                // CTRL-r toggles between fuzzy and exact matching
+                self.toggle_mode();
             }
             (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
                 // Type to add to the selection
@@ -654,6 +918,7 @@ impl Modal for CommandPalette {
     ) -> anyhow::Result<Ref<'_, [ComputedElement]>> {
         let selection = self.selection.borrow();
         let selection = selection.as_str();
+        let mode = *self.mode.borrow();
 
         let mut results = self.matches.borrow_mut();
 
@@ -673,12 +938,13 @@ impl Modal for CommandPalette {
 
         let rebuild_matches = results
             .as_ref()
-            .map(|m| m.selection != selection)
+            .map(|m| m.selection != selection || m.mode != mode)
             .unwrap_or(true);
         if rebuild_matches {
             results.replace(MatchResults {
                 selection: selection.to_string(),
-                matches: compute_matches(selection, &self.commands),
+                mode,
+                matches: compute_matches(selection, &self.commands, mode),
             });
         };
         let matches = results.as_ref().unwrap();
@@ -689,6 +955,7 @@ impl Modal for CommandPalette {
                 selection,
                 &self.commands,
                 matches,
+                mode,
                 max_rows_on_screen,
                 *self.selected_row.borrow(),
                 *self.top_row.borrow(),
@@ -702,5 +969,63 @@ impl Modal for CommandPalette {
 
     fn reconfigure(&self, _term_window: &mut TermWindow) {
         self.element.borrow_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn find_ci_ranges_basic() {
+        assert_eq!(find_ci_ranges("Activate Tab", "tab"), vec![(9, 12)]);
+        // all (non-overlapping) occurrences, regardless of case
+        assert_eq!(
+            find_ci_ranges("Tab tab TAB", "tab"),
+            vec![(0, 3), (4, 7), (8, 11)]
+        );
+        assert_eq!(find_ci_ranges("hello", "xyz"), vec![]);
+        assert_eq!(find_ci_ranges("hello", ""), vec![]);
+    }
+
+    #[test]
+    fn find_ci_ranges_multibyte() {
+        // "café" -> bytes: c(0) a(1) f(2) é(3..5)
+        assert_eq!(find_ci_ranges("café", "é"), vec![(3, 5)]);
+        assert_eq!(find_ci_ranges("a→b→c", "→"), vec![(1, 4), (5, 8)]);
+    }
+
+    #[test]
+    fn merge_ranges_overlapping_and_sorted() {
+        assert_eq!(
+            merge_ranges(vec![(0, 3), (2, 5), (7, 9)]),
+            vec![(0, 5), (7, 9)]
+        );
+        assert_eq!(merge_ranges(vec![(5, 7), (0, 2)]), vec![(0, 2), (5, 7)]);
+        // touching ranges merge
+        assert_eq!(merge_ranges(vec![(0, 3), (3, 6)]), vec![(0, 6)]);
+    }
+
+    #[test]
+    fn char_indices_to_byte_ranges_coalesces() {
+        assert_eq!(
+            char_indices_to_byte_ranges("abcde", &[1, 2, 4]),
+            vec![(1, 3), (4, 5)]
+        );
+        // out-of-range char indices are ignored
+        assert_eq!(char_indices_to_byte_ranges("ab", &[0, 9]), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn exact_mode_highlights_each_part_any_order() {
+        // parts may appear in any order; each occurrence is highlighted
+        let ranges = highlight_byte_ranges("New Tab", "tab new", CommandPaletteMatchMode::Exact);
+        assert_eq!(ranges, vec![(0, 3), (4, 7)]);
+
+        // empty / whitespace-only selection highlights nothing
+        assert_eq!(
+            highlight_byte_ranges("New Tab", "   ", CommandPaletteMatchMode::Exact),
+            vec![]
+        );
     }
 }

@@ -37,6 +37,20 @@ pub fn matcher_pattern(s: &str) -> Pattern {
     )
 }
 
+/// Returns the sorted, de-duplicated set of *character* indices in `s` that
+/// the pattern matched against, suitable for highlighting. Returns `None`
+/// when the pattern does not match `s`.
+pub fn matcher_indices(pattern: &Pattern, s: &str) -> Option<Vec<u32>> {
+    MATCHER.with_borrow_mut(|matcher| {
+        let mut buf = vec![];
+        let mut indices = vec![];
+        pattern.indices(Utf32Str::new(s, &mut buf), matcher, &mut indices)?;
+        indices.sort_unstable();
+        indices.dedup();
+        Some(indices)
+    })
+}
+
 struct SelectorState {
     active_idx: usize,
     max_items: usize,
