@@ -5,8 +5,6 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
 
 use anyhow::{bail, Context};
-use mio::unix::SourceFd;
-use mio::{Events, Interest, Poll, Token};
 use wayland_client::backend::WaylandError;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::{Connection as WConnection, EventQueue};
@@ -53,70 +51,86 @@ impl WaylandConnection {
     }
 
     fn run_message_loop_impl(&self) -> anyhow::Result<()> {
-        const TOK_WL: usize = 0xffff_fffc;
-        const TOK_SPAWN: usize = 0xffff_fffd;
-        let tok_wl = Token(TOK_WL);
-        let tok_spawn = Token(TOK_SPAWN);
-
-        let mut poll = Poll::new()?;
-        let mut events = Events::with_capacity(8);
-
-        let wl_fd = {
-            let read_guard = self.event_queue.borrow().prepare_read().unwrap();
-            read_guard.connection_fd().as_raw_fd()
-        };
-
-        poll.registry()
-            .register(&mut SourceFd(&wl_fd), tok_wl, Interest::READABLE)?;
-        poll.registry().register(
-            &mut SourceFd(&SPAWN_QUEUE.raw_fd()),
-            tok_spawn,
-            Interest::READABLE,
-        )?;
+        let spawn_fd = SPAWN_QUEUE.raw_fd();
 
         while !*self.should_terminate.borrow() {
-            let timeout = if SPAWN_QUEUE.run() {
-                Some(std::time::Duration::from_secs(0))
-            } else {
-                None
+            // Run a pending spawned function; if more remain we don't want to
+            // block in poll, so we'll use a zero timeout below.
+            let timeout_ms: libc::c_int = if SPAWN_QUEUE.run() { 0 } else { -1 };
+
+            // Dispatch whatever is already queued, then prepare to read more.
+            // dispatch_pending must run unconditionally every iteration: events
+            // read into the queue on the previous iteration (or demuxed into it
+            // by an unrelated socket read, e.g. Mesa's EGL swap reading the
+            // wayland fd to throttle) are only delivered to their handlers here.
+            // prepare_read() does *not* report those as pending, so gating the
+            // dispatch on it would silently drop events. The wayland-backend
+            // contract also requires the ReadEventsGuard to be created *before*
+            // we poll the socket, which we satisfy by holding it across poll.
+            let read_guard = loop {
+                {
+                    let mut event_q = self.event_queue.borrow_mut();
+                    let mut wayland_state = self.wayland_state.borrow_mut();
+                    event_q
+                        .dispatch_pending(&mut wayland_state)
+                        .context("error during event_q.dispatch_pending")?;
+                }
+                match self.event_queue.borrow().prepare_read() {
+                    Some(guard) => break guard,
+                    // Events arrived between the dispatch above and now; loop
+                    // to dispatch them before we sleep.
+                    None => continue,
+                }
             };
 
-            let mut event_q = self.event_queue.borrow_mut();
-            {
-                let mut wayland_state = self.wayland_state.borrow_mut();
-                if let Err(err) = event_q.dispatch_pending(&mut wayland_state) {
-                    // TODO: show the protocol error in the display
-                    return Err(err)
-                        .with_context(|| format!("error during event_q.dispatch protcol_error"));
-                }
-            }
+            let wl_fd = read_guard.connection_fd().as_raw_fd();
 
-            event_q.flush()?;
-            if let Err(err) = poll.poll(&mut events, timeout) {
+            self.event_queue.borrow().flush()?;
+
+            // Use a level-triggered libc::poll rather than mio's
+            // edge-triggered epoll: level-triggering re-reports a fd as ready
+            // for as long as it still holds unread data, so a partially
+            // drained socket (or an edge consumed by another reader) can never
+            // strand us asleep with a frame-callback reply -- or any other
+            // event -- still waiting to be read. That edge-triggered stall is
+            // what made the window freeze until an unrelated keypress.
+            let mut pfd = [
+                libc::pollfd {
+                    fd: wl_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: spawn_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+
+            let res = unsafe { libc::poll(pfd.as_mut_ptr(), pfd.len() as _, timeout_ms) };
+            if res < 0 {
+                let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
+                    // Dropping read_guard cancels the prepared read.
                     continue;
                 }
-                bail!("polling for events: {:?}", err);
+                bail!("polling for events: {:#}", err);
             }
 
-            for event in &events {
-                if event.token() != tok_wl {
-                    continue;
-                }
-
-                if let Some(guard) = event_q.prepare_read() {
-                    if let Err(err) = guard.read() {
-                        log::trace!("Event Q error: {:?}", err);
-                        if let WaylandError::Protocol(perr) = err {
-                            return Err(perr.into());
-                            // TODO
-                            // return Err(perr).with_context(|| {
-                            //     format!("error during event_q.read protocol_error={:?}",
-                            //             perr)
-                            // })
-                        }
+            if pfd[0].revents & libc::POLLIN != 0 {
+                // Read what's available into the queue; it is dispatched at the
+                // top of the next iteration.
+                if let Err(err) = read_guard.read() {
+                    match err {
+                        WaylandError::Io(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        WaylandError::Protocol(perr) => return Err(perr.into()),
+                        other => log::trace!("error reading wayland events: {:#}", other),
                     }
                 }
+            } else {
+                // Nothing to read from the socket; cancel the prepared read so
+                // the next iteration is free to dispatch.
+                drop(read_guard);
             }
         }
 
