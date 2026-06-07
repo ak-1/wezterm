@@ -692,6 +692,18 @@ pub(crate) fn read_pipe_with_timeout_bytes(mut file: ReadPipe) -> anyhow::Result
     Ok(result)
 }
 
+/// Painting on Wayland is throttled by the compositor's frame callbacks: after
+/// we paint we ask the compositor to tell us when it's ready for the next frame,
+/// and we suppress further painting until it does. If that callback never
+/// arrives (a compositor quirk, an occluded/idle surface, or a frame request
+/// that didn't end up committed), the window freezes and only repaints when some
+/// other event such as a keypress drives the event loop. To avoid that, we treat
+/// a frame callback that hasn't been answered within this window as lost and
+/// repaint anyway. A healthy compositor answers within one refresh interval
+/// (~16ms at 60Hz), so this is generous enough never to fire during normal
+/// operation, while bounding any freeze to ~one tenth of a second.
+const FRAME_CALLBACK_TIMEOUT: Duration = Duration::from_millis(100);
+
 pub struct WaylandWindowInner {
     pub(crate) events: WindowEventSender,
     surface_factor: f64,
@@ -711,7 +723,10 @@ pub struct WaylandWindowInner {
     pub(super) pending_event: Arc<Mutex<PendingEvent>>,
     pub(super) pending_mouse: Arc<Mutex<PendingMouse>>,
     pending_first_configure: Option<async_channel::Sender<()>>,
-    frame_callback: Option<WlCallback>,
+    /// The pending frame callback, if any, paired with the instant at which
+    /// we requested it. We use the timestamp as a watchdog: see
+    /// [`FRAME_CALLBACK_TIMEOUT`] and `frame_callback_pending`.
+    frame_callback: Option<(WlCallback, Instant)>,
     invalidated: bool,
     // font_config: Rc<FontConfiguration>,
     text_cursor: Option<Rect>,
@@ -1151,8 +1166,19 @@ impl WaylandWindowInner {
         }
     }
 
+    /// Returns true if we are waiting on a frame callback that the compositor
+    /// could still reasonably answer. Once the callback is older than
+    /// [`FRAME_CALLBACK_TIMEOUT`] we assume it was dropped and report it as no
+    /// longer pending so that callers will repaint rather than wait forever.
+    fn frame_callback_pending(&self) -> bool {
+        match &self.frame_callback {
+            Some((_, requested_at)) => requested_at.elapsed() < FRAME_CALLBACK_TIMEOUT,
+            None => false,
+        }
+    }
+
     fn invalidate(&mut self) {
-        if self.frame_callback.is_some() {
+        if self.frame_callback_pending() {
             self.invalidated = true;
             return;
         }
@@ -1241,7 +1267,7 @@ impl WaylandWindowInner {
             return Ok(());
         }
 
-        if self.frame_callback.is_some() {
+        if self.frame_callback_pending() {
             // Painting now won't be productive, so skip it but
             // remember that we need to be painted so that when
             // the compositor is ready for us, we can paint then.
@@ -1249,6 +1275,9 @@ impl WaylandWindowInner {
             return Ok(());
         }
 
+        // Either there is no outstanding callback, or the previous one is stale
+        // and presumed lost; drop it so we don't leak the expectation of a reply.
+        self.frame_callback.take();
         self.invalidated = false;
 
         // Ask the compositor to wake us up when its time to paint the next frame,
@@ -1259,7 +1288,7 @@ impl WaylandWindowInner {
         let callback = self.surface().frame(&qh, self.surface().clone());
 
         log::trace!("do_paint - callback: {:?}", callback);
-        self.frame_callback.replace(callback);
+        self.frame_callback.replace((callback, Instant::now()));
 
         // The repaint has the side of effect of committing the surface,
         // which is necessary for the frame callback to get triggered.
