@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context as _};
 use config::{create_user_owned_dirs, UnixDomain};
-use promise::spawn::spawn_into_main_thread;
 use wezterm_uds::UnixListener;
 
 pub struct LocalListener {
@@ -21,13 +20,21 @@ impl LocalListener {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    spawn_into_main_thread(async move {
-                        crate::dispatch::process(stream).await.map_err(|e| {
-                            log::error!("{:#}", e);
-                            e
+                    // Serve each local client on its own pair of blocking threads
+                    // rather than on the shared async executor; blocking I/O cannot
+                    // lose a readiness wakeup the way the edge-triggered async path
+                    // could, which previously froze the whole server until an
+                    // unrelated socket event arrived. See `dispatch::serve_local`.
+                    if let Err(err) = std::thread::Builder::new()
+                        .name("mux-client".to_string())
+                        .spawn(move || {
+                            if let Err(e) = crate::dispatch::serve_local(stream) {
+                                log::error!("{:#}", e);
+                            }
                         })
-                    })
-                    .detach();
+                    {
+                        log::error!("failed to spawn client thread: {:#}", err);
+                    }
                 }
                 Err(err) => {
                     log::error!("accept failed: {}", err);
