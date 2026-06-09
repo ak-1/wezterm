@@ -22,7 +22,7 @@ use smol::{block_on, Async};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::marker::Unpin;
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 #[cfg(unix)]
@@ -30,6 +30,8 @@ use std::os::unix::process::CommandExt;
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, RawSocket};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
@@ -337,44 +339,68 @@ enum NotReconnectableError {
     ClientWasDestroyed,
 }
 
+/// Tracks the in-flight request promises keyed by serial. Shared (behind an
+/// `Arc<Mutex<_>>`) between the blocking reader and writer threads; on the async
+/// path it is a plain local. The `Drop` impl fails any still-pending promises so
+/// callers waiting on a response don't hang when the connection goes away.
+struct Promises {
+    map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
+}
+
+impl Promises {
+    fn fail_all(&mut self, reason: &str) {
+        log::trace!("failing all promises: {}", reason);
+        for (_, promise) in self.map.drain() {
+            let _ = promise.try_send(Err(anyhow!("{}", reason)));
+        }
+    }
+}
+
+impl Drop for Promises {
+    fn drop(&mut self) {
+        self.fail_all("Client was destroyed");
+    }
+}
+
 fn client_thread(
     reconnectable: &mut Reconnectable,
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
-    block_on(client_thread_async(reconnectable, local_domain_id, rx))
+    let stream = reconnectable
+        .take_stream()
+        .expect("stream to be present after connect");
+
+    // For transports that can be split into independent blocking halves (unix
+    // sockets, ssh), drive the connection with two dedicated blocking threads
+    // instead of the async executor. async-io arms each fd with an
+    // edge/oneshot epoll registration (`PollMode::Oneshot`), and the reader loop
+    // recreates `readable()` every iteration via `smol::future::or(rx.recv(),
+    // wait_for_readable())`; that can lose a readiness edge, parking the
+    // connection -- and thus output delivery -- until an unrelated socket edge
+    // (the next keypress) wakes it. This is the client-side analogue of the
+    // mux-server `serve_local` fix. Blocking syscalls can't lose or spuriously
+    // deliver a wakeup, so no timeout/heartbeat is needed. TLS can't be split
+    // (its single OpenSSL state isn't safe to use from two threads) and stays
+    // on the async path.
+    match stream.into_blocking_split()? {
+        BlockingSplit::Supported(halves) => client_thread_blocking(halves, local_domain_id, rx),
+        BlockingSplit::Unsupported(stream) => {
+            block_on(client_thread_async(stream, local_domain_id, rx))
+        }
+    }
 }
 
 async fn client_thread_async(
-    reconnectable: &mut Reconnectable,
+    mut stream: Box<dyn AsyncReadAndWrite>,
     local_domain_id: Option<DomainId>,
     rx: &mut Receiver<ReaderMessage>,
 ) -> anyhow::Result<()> {
     let mut next_serial = 1u64;
 
-    struct Promises {
-        map: HashMap<u64, Sender<anyhow::Result<Pdu>>>,
-    }
-
-    impl Promises {
-        fn fail_all(&mut self, reason: &str) {
-            log::trace!("failing all promises: {}", reason);
-            for (_, promise) in self.map.drain() {
-                let _ = promise.try_send(Err(anyhow!("{}", reason)));
-            }
-        }
-    }
-
-    impl Drop for Promises {
-        fn drop(&mut self) {
-            self.fail_all("Client was destroyed");
-        }
-    }
     let mut promises = Promises {
         map: HashMap::new(),
     };
-
-    let mut stream = reconnectable.take_stream().unwrap();
 
     loop {
         let rx_msg = rx.recv();
@@ -432,6 +458,173 @@ async fn client_thread_async(
             }
         }
     }
+}
+
+/// Serve a connection with two dedicated blocking threads (see `client_thread`
+/// for why). The reader thread runs on this thread; a writer thread is spawned.
+/// Either direction ending tears down the other.
+fn client_thread_blocking(
+    halves: BlockingHalves,
+    local_domain_id: Option<DomainId>,
+    rx: &mut Receiver<ReaderMessage>,
+) -> anyhow::Result<()> {
+    let BlockingHalves {
+        reader,
+        writer,
+        shutdown,
+    } = halves;
+
+    // Shared between the two threads: the next serial to assign and the map of
+    // in-flight promises. The reader reads `next_serial` only as the sanity
+    // bound for `decode_with_max_serial`.
+    let next_serial = Arc::new(AtomicU64::new(1));
+    let promises = Arc::new(Mutex::new(Promises {
+        map: HashMap::new(),
+    }));
+
+    // Used by the reader to ask the writer to stop. A separate channel (rather
+    // than a sentinel on `rx`) keeps the public `ReaderMessage` channel
+    // untouched. Both branches the writer waits on are channel recvs, which --
+    // unlike async-io's fd readiness -- can't lose a wakeup.
+    let (shutdown_tx, shutdown_rx) = smol::channel::bounded::<()>(1);
+
+    let writer_thread = std::thread::Builder::new()
+        .name("wezterm-client-writer".to_string())
+        .spawn({
+            let next_serial = Arc::clone(&next_serial);
+            let promises = Arc::clone(&promises);
+            let shutdown = Arc::clone(&shutdown);
+            let rx = rx.clone();
+            move || run_writer(writer, rx, shutdown_rx, next_serial, promises, shutdown)
+        })
+        .context("spawning wezterm-client-writer thread")?;
+
+    let result = run_reader(
+        reader,
+        local_domain_id,
+        Arc::clone(&next_serial),
+        Arc::clone(&promises),
+    );
+
+    // The reader has stopped (eof/error). Unblock the writer if it's parked on
+    // the channel, and shut the connection down to unblock it if it's parked in
+    // a blocking write, then wait for it to exit.
+    let _ = shutdown_tx.try_send(());
+    (*shutdown)();
+    let _ = writer_thread.join();
+
+    // Dropping the last `promises` Arc here fails any still-pending requests via
+    // `Promises::drop`, matching the async path's teardown.
+    result
+}
+
+/// Blocking inbound loop: decode PDUs and dispatch them exactly as the async
+/// reader branch does (unilateral push, promise resolution, or error).
+fn run_reader(
+    mut reader: Box<dyn Read + Send>,
+    local_domain_id: Option<DomainId>,
+    next_serial: Arc<AtomicU64>,
+    promises: Arc<Mutex<Promises>>,
+) -> anyhow::Result<()> {
+    loop {
+        let max_serial = next_serial.load(Ordering::SeqCst);
+        match Pdu::decode_with_max_serial(&mut reader, Some(max_serial)) {
+            Ok(decoded) => {
+                log::debug!(
+                    "decoded serial {} {}",
+                    decoded.serial,
+                    decoded.pdu.pdu_name()
+                );
+                if decoded.serial == 0 {
+                    process_unilateral(local_domain_id, decoded)
+                        .context("processing unilateral PDU from server")
+                        .map_err(|e| {
+                            log::error!("process_unilateral: {:?}", e);
+                            e
+                        })?;
+                } else {
+                    let promise = promises.lock().unwrap().map.remove(&decoded.serial);
+                    match promise {
+                        Some(promise) => {
+                            if promise.try_send(Ok(decoded.pdu)).is_err() {
+                                return Err(NotReconnectableError::ClientWasDestroyed.into());
+                            }
+                        }
+                        None => {
+                            let reason =
+                                format!("got serial {:?} without a corresponding promise", decoded);
+                            promises.lock().unwrap().fail_all(&reason);
+                            anyhow::bail!("{}", reason);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let reason = format!("Error while decoding response pdu: {:#}", err);
+                log::error!("{}", reason);
+                promises.lock().unwrap().fail_all(&reason);
+                return Err(err).context("Error while decoding response pdu");
+            }
+        }
+    }
+}
+
+/// Blocking outbound loop: wait for an outgoing PDU (or a shutdown request) and
+/// write it. The promise is registered before the write so a fast response
+/// can't race ahead of it.
+fn run_writer(
+    mut writer: Box<dyn Write + Send>,
+    rx: Receiver<ReaderMessage>,
+    shutdown_rx: Receiver<()>,
+    next_serial: Arc<AtomicU64>,
+    promises: Arc<Mutex<Promises>>,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
+) {
+    enum Wake {
+        Send(ReaderMessage),
+        Stop,
+    }
+
+    loop {
+        let wake = block_on(smol::future::or(
+            async {
+                match rx.recv().await {
+                    Ok(msg) => Wake::Send(msg),
+                    Err(_) => Wake::Stop,
+                }
+            },
+            async {
+                let _ = shutdown_rx.recv().await;
+                Wake::Stop
+            },
+        ));
+
+        match wake {
+            Wake::Send(ReaderMessage::SendPdu { pdu, promise }) => {
+                let serial = next_serial.fetch_add(1, Ordering::SeqCst);
+                promises.lock().unwrap().map.insert(serial, promise);
+                if let Err(err) = pdu.encode(&mut writer, serial) {
+                    log::error!(
+                        "client writer: encoding a PDU to send to the server: {:#}",
+                        err
+                    );
+                    break;
+                }
+                if let Err(err) = writer.flush() {
+                    log::error!("client writer: flushing PDU to server: {:#}", err);
+                    break;
+                }
+            }
+            // `Readable` is only ever a marker on the async path; it is never
+            // sent through the channel.
+            Wake::Send(ReaderMessage::Readable) => {}
+            Wake::Stop => break,
+        }
+    }
+
+    // If we're stopping because of a write error, unblock the reader (which is
+    // otherwise parked in a blocking read) so the connection tears down.
+    (*shutdown)();
 }
 
 pub fn unix_connect_with_retry(
@@ -516,22 +709,105 @@ pub fn unix_connect_with_retry(
     error.expect("only get here after at least one unix fail")
 }
 
-#[async_trait(?Send)]
-pub trait AsyncReadAndWrite: Unpin + AsyncRead + AsyncWrite + std::fmt::Debug + Send {
-    async fn wait_for_readable(&self) -> anyhow::Result<()>;
+/// Independent blocking read/write halves of a connection, used to drive it
+/// with two dedicated blocking threads instead of the async executor (see
+/// `client_thread`).
+pub(crate) struct BlockingHalves {
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    /// Tears the connection down far enough to unblock a thread parked in a
+    /// blocking read or write (e.g. a socket `shutdown(2)`). It is a no-op for
+    /// transports like ssh pipes that have no such mechanism; there we rely on
+    /// the shutdown channel and on eof/`EPIPE` instead.
+    shutdown: Arc<dyn Fn() + Send + Sync>,
+}
+
+pub(crate) enum BlockingSplit {
+    /// The transport was split into independent blocking halves.
+    Supported(BlockingHalves),
+    /// The transport (TLS) can't be split safely; keep it on the async path.
+    Unsupported(Box<dyn AsyncReadAndWrite>),
 }
 
 #[async_trait(?Send)]
-impl<T> AsyncReadAndWrite for Async<T>
-where
-    T: std::fmt::Debug,
-    T: std::io::Write,
-    T: std::io::Read,
-    T: Send,
-    T: async_io::IoSafe,
+pub(crate) trait AsyncReadAndWrite:
+    Unpin + AsyncRead + AsyncWrite + std::fmt::Debug + Send
 {
+    async fn wait_for_readable(&self) -> anyhow::Result<()>;
+
+    /// Consume the stream and, if the transport supports being driven by two
+    /// dedicated blocking threads, return its independent blocking read/write
+    /// halves. TLS returns `Unsupported` (its single OpenSSL state can't be used
+    /// from two threads) and keeps using the async path.
+    fn into_blocking_split(self: Box<Self>) -> anyhow::Result<BlockingSplit>;
+}
+
+#[async_trait(?Send)]
+impl AsyncReadAndWrite for Async<UnixStream> {
     async fn wait_for_readable(&self) -> anyhow::Result<()> {
         Ok(self.readable().await?)
+    }
+
+    fn into_blocking_split(self: Box<Self>) -> anyhow::Result<BlockingSplit> {
+        // Take the fd out of async-io's reactor and restore blocking mode
+        // (`into_inner` does not do that for us).
+        let stream = (*self).into_inner().context("Async::into_inner unix")?;
+        stream
+            .set_nonblocking(false)
+            .context("clearing O_NONBLOCK on unix client socket")?;
+        // `try_clone` dups the fd; read and write are independent socket
+        // directions so two threads can use the clones concurrently. A third
+        // clone is kept solely to `shutdown(2)` the socket on teardown.
+        let reader = stream.try_clone().context("try_clone unix reader")?;
+        let writer = stream.try_clone().context("try_clone unix writer")?;
+        let shutdown_handle = stream.try_clone().context("try_clone unix shutdown")?;
+        Ok(BlockingSplit::Supported(BlockingHalves {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            shutdown: Arc::new(move || {
+                let _ = shutdown_handle.shutdown(Shutdown::Both);
+            }),
+        }))
+    }
+}
+
+#[async_trait(?Send)]
+impl AsyncReadAndWrite for Async<SshStream> {
+    async fn wait_for_readable(&self) -> anyhow::Result<()> {
+        Ok(self.readable().await?)
+    }
+
+    fn into_blocking_split(self: Box<Self>) -> anyhow::Result<BlockingSplit> {
+        let stream = (*self).into_inner().context("Async::into_inner ssh")?;
+        let SshStream {
+            mut stdin,
+            mut stdout,
+        } = stream;
+        // stdout was put into non-blocking mode by `Async::new`; stdin may or
+        // may not be. Both are driven by blocking threads, so force blocking.
+        stdout
+            .set_non_blocking(false)
+            .context("clearing O_NONBLOCK on ssh stdout")?;
+        stdin
+            .set_non_blocking(false)
+            .context("clearing O_NONBLOCK on ssh stdin")?;
+        Ok(BlockingSplit::Supported(BlockingHalves {
+            reader: Box::new(stdout),
+            writer: Box::new(stdin),
+            // ssh stdin/stdout are pipes with no `shutdown(2)`.
+            shutdown: Arc::new(|| {}),
+        }))
+    }
+}
+
+#[async_trait(?Send)]
+impl AsyncReadAndWrite for Async<AsyncSslStream> {
+    async fn wait_for_readable(&self) -> anyhow::Result<()> {
+        Ok(self.readable().await?)
+    }
+
+    fn into_blocking_split(self: Box<Self>) -> anyhow::Result<BlockingSplit> {
+        Ok(BlockingSplit::Unsupported(self))
     }
 }
 

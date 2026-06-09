@@ -234,7 +234,7 @@ async fn decode_raw_async<R: Unpin + AsyncRead + std::fmt::Debug>(
 
 /// Decode a frame.
 /// See encode_raw() for the frame format.
-fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
+fn decode_raw<R: std::io::Read>(mut r: R, max_serial: Option<u64>) -> anyhow::Result<Decoded> {
     let len = read_u64(r.by_ref()).context("reading PDU length")?;
     let (len, is_compressed) = if (len & COMPRESSED_MASK) != 0 {
         (len & !COMPRESSED_MASK, true)
@@ -242,6 +242,15 @@ fn decode_raw<R: std::io::Read>(mut r: R) -> anyhow::Result<Decoded> {
         (len, false)
     };
     let serial = read_u64(r.by_ref()).context("reading PDU serial")?;
+    if let Some(max_serial) = max_serial {
+        if serial > max_serial && max_serial > 0 {
+            return Err(CorruptResponse(format!(
+                "decode_raw: serial {serial} is implausibly large \
+                (bigger than {max_serial})"
+            ))
+            .into());
+        }
+    }
     let ident = read_u64(r.by_ref()).context("reading PDU ident")?;
     let data_len =
         match (len as usize).overflowing_sub(encoded_length(ident) + encoded_length(serial)) {
@@ -386,7 +395,18 @@ macro_rules! pdu {
             }
 
             pub fn decode<R: std::io::Read>(r: R) -> Result<DecodedPdu, Error> {
-                let decoded = decode_raw(r).context("decoding a PDU")?;
+                Self::decode_with_max_serial(r, None)
+            }
+
+            /// Like [`decode`](Self::decode) but, like the async decoder, rejects a
+            /// frame whose serial is implausibly larger than `max_serial`. Used by
+            /// the blocking client reader to keep the corrupt-response guard that
+            /// `decode_async` provides (e.g. against ssh shell-startup garbage).
+            pub fn decode_with_max_serial<R: std::io::Read>(
+                r: R,
+                max_serial: Option<u64>,
+            ) -> Result<DecodedPdu, Error> {
+                let decoded = decode_raw(r, max_serial).context("decoding a PDU")?;
                 match decoded.ident {
                     $(
                         $vers => {
@@ -1164,7 +1184,7 @@ mod test {
         let mut encoded = Vec::new();
         encode_raw(0x81, 0x42, b"hello", false, &mut encoded).unwrap();
         assert_eq!(&encoded, b"\x08\x42\x81\x01hello");
-        let decoded = decode_raw(encoded.as_slice()).unwrap();
+        let decoded = decode_raw(encoded.as_slice(), None).unwrap();
         assert_eq!(decoded.ident, 0x81);
         assert_eq!(decoded.serial, 0x42);
         assert_eq!(decoded.data, b"hello");
@@ -1178,7 +1198,7 @@ mod test {
             payload.resize(*target_len, b'a');
             let mut encoded = Vec::new();
             encode_raw(0x42, serial, payload.as_slice(), false, &mut encoded).unwrap();
-            let decoded = decode_raw(encoded.as_slice()).unwrap();
+            let decoded = decode_raw(encoded.as_slice(), None).unwrap();
             assert_eq!(decoded.ident, 0x42);
             assert_eq!(decoded.serial, serial);
             assert_eq!(decoded.data, payload);
