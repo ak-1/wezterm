@@ -121,7 +121,9 @@ impl KeyRepeatState {
                     return;
                 }
                 delay = Duration::from_millis(ddelay);
-                gap = Duration::from_millis(1000 / rate);
+                // Clamp to at least 1ms: a repeat rate above 1000Hz would
+                // otherwise produce a zero gap and spin this task flat out.
+                gap = Duration::from_millis((1000 / rate).max(1));
             }
 
             let mut initial = true;
