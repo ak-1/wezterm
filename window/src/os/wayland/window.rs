@@ -1605,10 +1605,43 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _conn: &WConnection,
         _qh: &wayland_client::QueueHandle<Self>,
-        _surface: &wayland_client::protocol::wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wayland_client::protocol::wl_surface::WlSurface,
+        new_factor: i32,
     ) {
-        // We do nothing, we get the scale_factor from surface_data
+        // SCTK has already recorded the new factor in the surface's
+        // SurfaceData, which is where dispatch_pending_event reads it from;
+        // our job here is to make sure a configure actually runs. Scale
+        // changes (moving the window to an output with a different scale)
+        // don't come with an xdg configure of their own, so without
+        // synthesizing one here the window would keep rendering at the old
+        // scale -- blurry or wrongly sized -- until the next interactive
+        // resize.
+        let Some(surface_data) = SurfaceUserData::try_from_wl(surface) else {
+            // Not a window surface, e.g. one of the CSD frame's subsurfaces.
+            return;
+        };
+        let window_id = surface_data.window_id;
+        let Some(win) = self.window_by_id(window_id) else {
+            return;
+        };
+
+        let changed = {
+            let pending_event = win.borrow().pending_event.clone();
+            let mut pending_event = pending_event.lock().unwrap();
+            let dpi = (new_factor as f64 * crate::DEFAULT_DPI) as i32;
+            if pending_event.dpi != Some(dpi) {
+                pending_event.dpi.replace(dpi);
+                true
+            } else {
+                false
+            }
+        };
+        if changed {
+            WaylandConnection::with_window_inner(window_id, |inner| {
+                inner.dispatch_pending_event();
+                Ok(())
+            });
+        }
     }
 
     fn frame(
