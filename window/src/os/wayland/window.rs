@@ -282,22 +282,29 @@ impl WaylandWindow {
         let hidden =
             !wants_fallback_frame(decorations) || decor_mode != Some(DecorationMode::Client);
         window_frame.set_hidden(hidden);
+        let surface_width = dimensions.pixels_to_surface(dimensions.pixel_width as i32);
+        let surface_height = dimensions.pixels_to_surface(dimensions.pixel_height as i32);
         if !hidden {
+            // The frame is sized to the content it wraps, in surface
+            // coordinates; it lays its decoration parts out around that.
             window_frame.resize(
-                NonZeroU32::new(dimensions.pixel_width as u32)
+                NonZeroU32::new(surface_width as u32)
                     .ok_or_else(|| anyhow!("dimensions {dimensions:?} are invalid"))?,
-                NonZeroU32::new(dimensions.pixel_height as u32)
+                NonZeroU32::new(surface_height as u32)
                     .ok_or_else(|| anyhow!("dimensions {dimensions:?} are invalid"))?,
             );
         }
 
         window.set_min_size(Some((32, 32)));
         let (x, y) = window_frame.location();
-        let surface_width = dimensions.pixels_to_surface(dimensions.pixel_width as i32);
-        let surface_height = dimensions.pixels_to_surface(dimensions.pixel_height as i32);
+        // The window geometry spans the CSD frame (when visible) plus the
+        // content beneath it; add_borders is a no-op while the frame is
+        // hidden.
+        let (geometry_width, geometry_height) =
+            window_frame.add_borders(surface_width as u32, surface_height as u32);
         window
             .xdg_surface()
-            .set_window_geometry(x, y, surface_width, surface_height);
+            .set_window_geometry(x, y, geometry_width as i32, geometry_height as i32);
         window.commit();
 
         let copy_and_paste = CopyAndPaste::create();
@@ -972,8 +979,10 @@ impl WaylandWindowInner {
 
         if pending.configure.is_none() {
             if pending.dpi.is_some() {
-                // Synthesize a pending configure event for the dpi change
-                pending.configure.replace((
+                // Synthesize a pending configure event for the dpi change.
+                // Configure sizes are window-geometry (outer) sizes, so add
+                // the CSD frame back onto our content dimensions.
+                pending.configure.replace(self.window_frame.add_borders(
                     self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
                     self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
                 ));
@@ -1001,9 +1010,12 @@ impl WaylandWindowInner {
                 pending.refresh_decorations = true;
                 // Ensure the frame is (re)sized and the window geometry is
                 // recomputed for the new decoration state, even if this
-                // configure carried no new size.
+                // configure carried no new size. The synthesized size is an
+                // outer size: set_hidden has already been applied above, so
+                // add_borders reflects the frame's new visibility and the
+                // content size is preserved across the transition.
                 if pending.configure.is_none() {
-                    pending.configure.replace((
+                    pending.configure.replace(self.window_frame.add_borders(
                         self.pixels_to_surface(self.dimensions.pixel_width as i32) as u32,
                         self.pixels_to_surface(self.dimensions.pixel_height as i32) as u32,
                     ));
@@ -1023,6 +1035,19 @@ impl WaylandWindowInner {
 
                 // Do this early because this affects surface_to_pixels/pixels_to_surface
                 self.dimensions.dpi = dpi;
+
+                // The configure size refers to the window geometry, which
+                // includes the CSD frame when it is visible; what remains
+                // after subtracting the frame is the content size.
+                if !self.window_frame.is_hidden() {
+                    let one = NonZeroU32::new(1).unwrap();
+                    let (content_w, content_h) = self.window_frame.subtract_borders(
+                        NonZeroU32::new(w).unwrap_or(one),
+                        NonZeroU32::new(h).unwrap_or(one),
+                    );
+                    w = content_w.unwrap_or(one).get();
+                    h = content_h.unwrap_or(one).get();
+                }
 
                 let mut pixel_width = self.surface_to_pixels(w.try_into().unwrap());
                 let mut pixel_height = self.surface_to_pixels(h.try_into().unwrap());
@@ -1055,11 +1080,16 @@ impl WaylandWindowInner {
                 let (x, y) = self.window_frame.location();
                 let surface_width = self.pixels_to_surface(pixel_width);
                 let surface_height = self.pixels_to_surface(pixel_height);
+                // Declare a geometry spanning the frame (when visible) plus
+                // the content beneath it.
+                let (geometry_width, geometry_height) = self
+                    .window_frame
+                    .add_borders(surface_width as u32, surface_height as u32);
                 self.window
                     .as_mut()
                     .unwrap()
                     .xdg_surface()
-                    .set_window_geometry(x, y, surface_width, surface_height);
+                    .set_window_geometry(x, y, geometry_width as i32, geometry_height as i32);
                 // Compute the new pixel dimensions
                 let new_dimensions = Dimensions {
                     pixel_width: pixel_width.try_into().unwrap(),
@@ -1248,12 +1278,14 @@ impl WaylandWindowInner {
         // window.resize() doesn't generate a configure event,
         // so we're going to fake one up, otherwise the window
         // contents don't reflect the real size until eg:
-        // the focus is changed.
+        // the focus is changed. The requested size is the desired
+        // content size; configure sizes are outer (window-geometry)
+        // sizes, so add the CSD frame onto it.
         self.pending_event
             .lock()
             .unwrap()
             .configure
-            .replace((surface_width, surface_height));
+            .replace(self.window_frame.add_borders(surface_width, surface_height));
         // apply the synthetic configure event to the inner surfaces
         self.dispatch_pending_event();
 
