@@ -85,7 +85,23 @@ impl WaylandConnection {
 
             let wl_fd = read_guard.connection_fd().as_raw_fd();
 
-            self.event_queue.borrow().flush()?;
+            // Flush our pending requests. WouldBlock here means the socket's
+            // send buffer is full (the compositor is slow to read us); the
+            // unsent requests stay buffered in the backend, so it is not
+            // fatal. Ask poll below to additionally wake us when the socket
+            // becomes writable, and retry the flush on the next iteration.
+            let mut flush_pending = false;
+            match self.event_queue.borrow().flush() {
+                Ok(()) => {}
+                Err(WaylandError::Io(ref err))
+                    if err.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    flush_pending = true;
+                }
+                Err(err) => {
+                    return Err(err).context("error flushing wayland event queue");
+                }
+            }
 
             // Use a level-triggered libc::poll rather than mio's
             // edge-triggered epoll: level-triggering re-reports a fd as ready
@@ -97,7 +113,7 @@ impl WaylandConnection {
             let mut pfd = [
                 libc::pollfd {
                     fd: wl_fd,
-                    events: libc::POLLIN,
+                    events: libc::POLLIN | if flush_pending { libc::POLLOUT } else { 0 },
                     revents: 0,
                 },
                 libc::pollfd {
