@@ -66,25 +66,33 @@ lazy_static::lazy_static! {
 }
 
 pub async fn read_setting(namespace: &str, key: &str) -> anyhow::Result<OwnedValue> {
-    let connection = zbus::ConnectionBuilder::session()?.build().await?;
-    let proxy = PortalSettingsProxy::new(&connection)
-        .await
-        .context("make proxy")?;
+    // Bound the *whole* exchange, including connecting to the session bus:
+    // the connection build previously sat outside the timeout, so a wedged
+    // bus (e.g. after suspend/resume) could block the caller indefinitely --
+    // and the GUI thread blocks on this during window creation.
+    let read = async {
+        let connection = zbus::ConnectionBuilder::session()?.build().await?;
+        let proxy = PortalSettingsProxy::new(&connection)
+            .await
+            .context("make proxy")?;
+        proxy
+            .Read(namespace, key)
+            .await
+            .map_err(anyhow::Error::from)
+    };
 
-    proxy
-        .Read(namespace, key)
-        .or(async {
-            async_io::Timer::after(std::time::Duration::from_secs(1)).await;
-            Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Timed out reading from xdg-portal; this indicates a problem \
-                 with your graphical environment. Consider running \
-                 'systemctl restart --user xdg-desktop-portal.service'",
-            )
-            .into())
-        })
-        .await
-        .with_context(|| format!("Reading xdg-portal {namespace} {key}"))
+    read.or(async {
+        async_io::Timer::after(std::time::Duration::from_secs(1)).await;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "Timed out reading from xdg-portal; this indicates a problem \
+             with your graphical environment. Consider running \
+             'systemctl restart --user xdg-desktop-portal.service'",
+        )
+        .into())
+    })
+    .await
+    .with_context(|| format!("Reading xdg-portal {namespace} {key}"))
 }
 
 fn value_to_appearance(value: OwnedValue) -> anyhow::Result<Appearance> {
@@ -101,28 +109,34 @@ fn value_to_appearance(value: OwnedValue) -> anyhow::Result<Appearance> {
 }
 
 pub async fn get_appearance() -> anyhow::Result<Option<Appearance>> {
-    let mut state = STATE.lock().unwrap();
+    // Take care not to hold the mutex across the dbus round-trip below:
+    // a slow portal would otherwise block every other caller on the lock
+    // in addition to the one doing the query.
+    {
+        let state = STATE.lock().unwrap();
 
-    match &state.appearance {
-        CachedAppearance::Some(_)
-            if (state.subscribe_running || state.last_update.elapsed().as_secs() < 1) =>
-        {
-            // Known values are considered good while our subscription is running,
-            // or for 1 second since we last queried
-            return state.appearance.to_result();
-        }
-        CachedAppearance::None => {
-            // Permanently cache the error state
-            return Ok(None);
-        }
-        CachedAppearance::Some(_) | CachedAppearance::Unknown => {
-            // We'll need to query for these
+        match &state.appearance {
+            CachedAppearance::Some(_)
+                if (state.subscribe_running || state.last_update.elapsed().as_secs() < 1) =>
+            {
+                // Known values are considered good while our subscription is running,
+                // or for 1 second since we last queried
+                return state.appearance.to_result();
+            }
+            CachedAppearance::None => {
+                // Permanently cache the error state
+                return Ok(None);
+            }
+            CachedAppearance::Some(_) | CachedAppearance::Unknown => {
+                // We'll need to query for these
+            }
         }
     }
 
     match read_setting("org.freedesktop.appearance", "color-scheme").await {
         Ok(value) => {
             let appearance = value_to_appearance(value).context("value_to_appearance")?;
+            let mut state = STATE.lock().unwrap();
             state.appearance = CachedAppearance::Some(appearance);
             state.last_update = Instant::now();
             Ok(Some(appearance))
@@ -130,6 +144,7 @@ pub async fn get_appearance() -> anyhow::Result<Option<Appearance>> {
         Err(err) => {
             // Cache that we didn't get any value, so we can avoid
             // repeating this query again later
+            let mut state = STATE.lock().unwrap();
             state.appearance = CachedAppearance::None;
             state.last_update = Instant::now();
             // but bubble up the underlying message so that we can
