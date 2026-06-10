@@ -986,12 +986,14 @@ impl WaylandWindowInner {
             self.events.dispatch(WindowEvent::CloseRequested);
         }
 
+        let mut window_state_changed = false;
         if let Some(window_state) = pending.window_state.take() {
             log::debug!(
                 "dispatch_pending_event self.window_state={:?}, pending:{:?}",
                 self.window_state,
                 window_state
             );
+            window_state_changed = self.window_state != window_state;
             self.window_state = window_state;
         }
 
@@ -1119,6 +1121,7 @@ impl WaylandWindowInner {
                 // this makes things more efficient and a little more smooth
                 if new_dimensions != old_dimensions {
                     self.dimensions = new_dimensions;
+                    window_state_changed = false;
 
                     self.events.dispatch(WindowEvent::Resized {
                         dimensions: self.dimensions,
@@ -1164,6 +1167,18 @@ impl WaylandWindowInner {
                 }
                 self.do_paint().unwrap();
             }
+        }
+        if window_state_changed && self.window.is_some() {
+            // A state-only configure, e.g. maximize granted at an unchanged
+            // size. Resized is the only event that carries window_state, so
+            // emit one even though the dimensions did not change; otherwise
+            // the GUI's notion of the state (integrated button glyphs,
+            // resize border) goes stale.
+            self.events.dispatch(WindowEvent::Resized {
+                dimensions: self.dimensions,
+                window_state: self.window_state,
+                live_resizing: false,
+            });
         }
         if pending.refresh_decorations && self.window.is_some() {
             self.refresh_frame();
