@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -7,7 +6,6 @@ use smithay_client_toolkit::reexports::csd_frame::{DecorationsFrame, FrameClick}
 use smithay_client_toolkit::seat::pointer::{
     CursorIcon, PointerData, PointerDataExt, PointerEvent, PointerEventKind, PointerHandler,
 };
-use wayland_client::backend::ObjectId;
 use wayland_client::protocol::wl_pointer::{ButtonState, WlPointer};
 use wayland_client::protocol::wl_seat::WlSeat;
 use wayland_client::{Connection, Proxy, QueueHandle};
@@ -28,27 +26,18 @@ impl PointerHandler for WaylandState {
         pointer: &WlPointer,
         events: &[PointerEvent],
     ) {
-        let mut pstate = pointer
-            .data::<PointerUserData>()
-            .unwrap()
-            .state
-            .lock()
-            .unwrap();
-
         for evt in events {
-            if let PointerEventKind::Enter { .. } = &evt.kind {
-                let surface_id = evt.surface.id();
-                self.active_surface_id = RefCell::new(Some(surface_id.clone()));
-                pstate.active_surface_id = Some(surface_id);
-            }
             if let Some(serial) = event_serial(&evt) {
                 *self.last_serial.borrow_mut() = serial;
-                pstate.serial = serial;
             }
-            if let Some(pending) = self
-                .surface_to_pending
-                .get(&self.active_surface_id.borrow().as_ref().unwrap())
-            {
+            // Route by the surface each event names. Pointer focus and
+            // keyboard focus are independent: active_surface_id tracks the
+            // keyboard focus (it routes incoming selection offers and IME
+            // state), and routing pointer events by it delivered them to
+            // the keyboard-focused window whenever the pointer was hovering
+            // a different one -- stuck buttons in one window, selections in
+            // the other.
+            if let Some(pending) = self.surface_to_pending.get(&evt.surface.id()) {
                 let mut pending = pending.lock().unwrap();
                 if pending.queue(evt) {
                     WaylandConnection::with_window_inner(pending.window_id, move |inner| {
@@ -78,9 +67,7 @@ impl PointerUserData {
 
 #[derive(Default)]
 pub(super) struct PointerState {
-    active_surface_id: Option<ObjectId>,
     pub(super) drag_and_drop: DragAndDrop,
-    serial: u32,
 }
 
 impl PointerDataExt for PointerUserData {
@@ -224,66 +211,68 @@ impl WaylandState {
         let mut frame_cursor: Option<Option<CursorIcon>> = None;
 
         for evt in events {
-            let surface = &evt.surface;
-            if surface.id() == self.active_surface_id.borrow().as_ref().unwrap().clone() {
-                let (x, y) = evt.position;
-                let parent_surface = match evt.surface.data::<SurfaceData>() {
-                    Some(data) => match data.parent_surface() {
-                        Some(sd) => sd,
-                        None => continue,
-                    },
+            // Frame events arrive on the decoration subsurfaces; resolve
+            // those to the window that owns them via their parent surface.
+            // Events on a window's main surface (which has no parent) are
+            // not frame events.
+            let parent_surface = match evt.surface.data::<SurfaceData>() {
+                Some(data) => match data.parent_surface() {
+                    Some(sd) => sd,
                     None => continue,
-                };
+                },
+                None => continue,
+            };
 
-                let wid = SurfaceUserData::from_wl(parent_surface).window_id;
-                let mut inner = windows.get(&wid).unwrap().borrow_mut();
+            let Some(surface_data) = SurfaceUserData::try_from_wl(parent_surface) else {
+                continue;
+            };
+            let Some(window) = windows.get(&surface_data.window_id) else {
+                continue;
+            };
+            let mut inner = window.borrow_mut();
+            let (x, y) = evt.position;
 
-                match evt.kind {
-                    PointerEventKind::Enter { .. } => {
-                        let icon = inner.window_frame.click_point_moved(
-                            Duration::ZERO,
-                            &evt.surface.id(),
-                            x,
-                            y,
-                        );
-                        if !inner.window_frame.is_hidden() {
-                            frame_cursor = Some(icon);
-                        }
+            match evt.kind {
+                PointerEventKind::Enter { .. } => {
+                    let icon = inner.window_frame.click_point_moved(
+                        Duration::ZERO,
+                        &evt.surface.id(),
+                        x,
+                        y,
+                    );
+                    if !inner.window_frame.is_hidden() {
+                        frame_cursor = Some(icon);
                     }
-                    PointerEventKind::Leave { .. } => {
-                        inner.window_frame.click_point_left();
-                    }
-                    PointerEventKind::Motion { .. } => {
-                        let icon = inner.window_frame.click_point_moved(
-                            Duration::ZERO,
-                            &evt.surface.id(),
-                            x,
-                            y,
-                        );
-                        if !inner.window_frame.is_hidden() {
-                            frame_cursor = Some(icon);
-                        }
-                    }
-                    PointerEventKind::Press { button, serial, .. }
-                    | PointerEventKind::Release { button, serial, .. } => {
-                        let pressed = if matches!(evt.kind, PointerEventKind::Press { .. }) {
-                            true
-                        } else {
-                            false
-                        };
-                        let click = match button {
-                            0x110 => FrameClick::Normal,
-                            0x111 => FrameClick::Alternate,
-                            _ => continue,
-                        };
-                        if let Some(action) =
-                            inner.window_frame.on_click(Duration::ZERO, click, pressed)
-                        {
-                            inner.frame_action(pointer, serial, action);
-                        }
-                    }
-                    _ => {}
                 }
+                PointerEventKind::Leave { .. } => {
+                    inner.window_frame.click_point_left();
+                }
+                PointerEventKind::Motion { .. } => {
+                    let icon = inner.window_frame.click_point_moved(
+                        Duration::ZERO,
+                        &evt.surface.id(),
+                        x,
+                        y,
+                    );
+                    if !inner.window_frame.is_hidden() {
+                        frame_cursor = Some(icon);
+                    }
+                }
+                PointerEventKind::Press { button, serial, .. }
+                | PointerEventKind::Release { button, serial, .. } => {
+                    let pressed = matches!(evt.kind, PointerEventKind::Press { .. });
+                    let click = match button {
+                        0x110 => FrameClick::Normal,
+                        0x111 => FrameClick::Alternate,
+                        _ => continue,
+                    };
+                    if let Some(action) =
+                        inner.window_frame.on_click(Duration::ZERO, click, pressed)
+                    {
+                        inner.frame_action(pointer, serial, action);
+                    }
+                }
+                _ => {}
             }
         }
 
