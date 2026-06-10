@@ -79,6 +79,11 @@ impl OutputManagerState {
         log::debug!("zwlr_head_info: {:#?}", inner.zwlr_head_info);
 
         for head in inner.zwlr_head_info.values() {
+            if !head.enabled {
+                // A disabled head has no usable mode/position; don't let it
+                // contribute a phantom screen to the layout.
+                continue;
+            }
             let name = head.name.clone();
             let (width, height) = match head.current_mode_id.clone() {
                 Some(mode_id) => match inner.zwlr_mode_info.get(&mode_id) {
@@ -210,6 +215,13 @@ impl Dispatch<ZwlrOutputHeadV1, OutputManagerData, WaylandState> for OutputManag
             }
             ZwlrOutputHeadEvent::Enabled { enabled } => {
                 info.enabled = enabled != 0;
+                if !info.enabled {
+                    // The protocol stops describing a disabled head; clear
+                    // the stale mode so a later re-enable can't pair it with
+                    // outdated state. The compositor re-sends current_mode
+                    // when the head is enabled again.
+                    info.current_mode_id = None;
+                }
             }
             ZwlrOutputHeadEvent::CurrentMode { mode } => {
                 let mode_id = mode.id();
