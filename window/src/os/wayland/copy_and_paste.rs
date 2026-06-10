@@ -105,11 +105,16 @@ impl CopyAndPaste {
                     .replace((source, data));
             }
             None => {
-                let data_device = &wayland_state.data_device;
+                if wayland_state.data_device.is_none() {
+                    // No seat has been announced yet, so there is no device
+                    // to own the selection.
+                    log::error!("set_clipboard_data: no data device available");
+                    return;
+                }
                 let source = wayland_state
                     .data_device_manager_state
                     .create_copy_paste_source(&qh, vec![TEXT_MIME_TYPE]);
-                source.set_selection(data_device.as_ref().unwrap(), last_serial);
+                source.set_selection(wayland_state.data_device.as_ref().unwrap(), last_serial);
                 wayland_state.copy_paste_source.replace((source, data));
             }
         }
