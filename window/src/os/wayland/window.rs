@@ -758,7 +758,19 @@ pub struct WaylandWindowInner {
 impl WaylandWindowInner {
     fn close(&mut self) {
         self.events.dispatch(WindowEvent::Destroyed);
-        self.window.take();
+        if let Some(window) = self.window.take() {
+            // Drop the connection's bookkeeping for this window, so that the
+            // maps don't accumulate dead windows (and keep broadcasting
+            // events to them) for the lifetime of the process. We are called
+            // via with_window_inner, whose Rc keeps `self` alive until the
+            // closure returns, so removing the map entry here is safe.
+            let surface_id = window.wl_surface().id();
+            let window_id = SurfaceUserData::from_wl(window.wl_surface()).window_id;
+            let conn = WaylandConnection::get().unwrap().wayland();
+            let mut state = conn.wayland_state.borrow_mut();
+            state.surface_to_pending.remove(&surface_id);
+            state.windows.borrow_mut().remove(&window_id);
+        }
     }
 
     fn show(&mut self) {
