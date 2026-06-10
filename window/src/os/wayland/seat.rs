@@ -14,8 +14,10 @@ impl SeatHandler for WaylandState {
         &mut self.seat
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {
-        todo!()
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: WlSeat) {
+        // Input devices are set up as the seat announces its capabilities
+        // via new_capability; there is nothing to do for the seat itself.
+        log::trace!("new seat: {seat:?}");
     }
 
     fn new_capability(
@@ -94,7 +96,9 @@ impl SeatHandler for WaylandState {
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: WlSeat) {
-        todo!()
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: WlSeat) {
+        // The input devices that belonged to this seat have already been
+        // released via remove_capability.
+        log::trace!("seat removed: {seat:?}");
     }
 }
