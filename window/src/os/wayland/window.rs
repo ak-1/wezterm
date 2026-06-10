@@ -409,7 +409,11 @@ impl WindowOps for WaylandWindow {
 
     fn hide(&self) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
-            inner.window.as_ref().unwrap().set_minimized();
+            // The window may already be closed/destroyed by the time this
+            // queued operation runs.
+            if let Some(window) = inner.window.as_ref() {
+                window.set_minimized();
+            }
             Ok(())
         });
     }
@@ -540,10 +544,12 @@ impl WindowOps for WaylandWindow {
 
     fn toggle_fullscreen(&self) {
         WaylandConnection::with_window_inner(self.0, move |inner| {
-            if inner.window_state.contains(WindowState::FULL_SCREEN) {
-                inner.window.as_ref().unwrap().unset_fullscreen();
-            } else {
-                inner.window.as_ref().unwrap().set_fullscreen(None);
+            if let Some(window) = inner.window.as_ref() {
+                if inner.window_state.contains(WindowState::FULL_SCREEN) {
+                    window.unset_fullscreen();
+                } else {
+                    window.set_fullscreen(None);
+                }
             }
             Ok(())
         });
@@ -1448,17 +1454,17 @@ impl WaylandWindowInner {
     pub(super) fn frame_action(&mut self, pointer: &WlPointer, serial: u32, action: FrameAction) {
         let pointer_data = pointer.data::<PointerUserData>().unwrap();
         let seat = pointer_data.pdata.seat();
+        // In-flight frame clicks can still arrive while the window is being
+        // closed/destroyed.
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
         match action {
             FrameAction::Close => self.events.dispatch(WindowEvent::CloseRequested),
-            FrameAction::Minimize => self.window.as_ref().unwrap().set_minimized(),
-            FrameAction::Maximize => self.window.as_ref().unwrap().set_maximized(),
-            FrameAction::UnMaximize => self.window.as_ref().unwrap().unset_maximized(),
-            FrameAction::ShowMenu(x, y) => {
-                self.window
-                    .as_ref()
-                    .unwrap()
-                    .show_window_menu(seat, serial, (x, y))
-            }
+            FrameAction::Minimize => window.set_minimized(),
+            FrameAction::Maximize => window.set_maximized(),
+            FrameAction::UnMaximize => window.unset_maximized(),
+            FrameAction::ShowMenu(x, y) => window.show_window_menu(seat, serial, (x, y)),
             FrameAction::Resize(edge) => {
                 let edge = match edge {
                     ResizeEdge::None => XdgResizeEdge::None,
@@ -1472,9 +1478,9 @@ impl WaylandWindowInner {
                     ResizeEdge::BottomRight => XdgResizeEdge::BottomRight,
                     _ => return, // Realistically, there probably won't be any new edges added.
                 };
-                self.window.as_ref().unwrap().resize(seat, serial, edge)
+                window.resize(seat, serial, edge)
             }
-            FrameAction::Move => self.window.as_ref().unwrap().move_(seat, serial),
+            FrameAction::Move => window.move_(seat, serial),
             _ => log::warn!("unhandled FrameAction: {:?}", action),
         }
     }
@@ -1550,11 +1556,16 @@ impl WaylandWindowInner {
     }
 
     fn update_window_background_blur(&self) {
+        let Some(window) = self.window.as_ref() else {
+            // A config reload can race with window teardown; there is no
+            // surface to apply the blur to.
+            return;
+        };
         let conn = WaylandConnection::get().unwrap().wayland();
         let qh = conn.event_queue.borrow().handle();
         let wayland_state = conn.wayland_state.borrow();
         if let Some(manager) = &wayland_state.kde_blur_manager {
-            let kde_blur = manager.create(self.surface(), &qh, GlobalData);
+            let kde_blur = manager.create(window.wl_surface(), &qh, GlobalData);
             if self.config.kde_window_background_blur {
                 kde_blur.set_region(None);
             } else {
