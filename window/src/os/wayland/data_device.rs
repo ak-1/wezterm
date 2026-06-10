@@ -1,3 +1,4 @@
+use smithay_client_toolkit::compositor::SurfaceData;
 use smithay_client_toolkit::data_device_manager::data_device::DataDeviceHandler;
 use smithay_client_toolkit::data_device_manager::data_offer::DataOfferHandler;
 use smithay_client_toolkit::data_device_manager::data_source::DataSourceHandler;
@@ -36,14 +37,33 @@ impl DataDeviceHandler for WaylandState {
             }
         };
 
-        let drag_offer = data.drag_offer().unwrap();
+        let Some(drag_offer) = data.drag_offer() else {
+            log::warn!("drag enter without a drag offer");
+            return;
+        };
 
         log::trace!("Data offer entered: {:?}", drag_offer);
 
-        // Skip the event if not for a top-level surface (no associated top-level user data)
+        // The drag may enter one of our non-window surfaces, e.g. a CSD
+        // frame subsurface (the title bar); those carry SCTK's plain
+        // SurfaceData rather than our SurfaceUserData, so resolve them to
+        // the window via their parent surface.
         let window_id = match SurfaceUserData::try_from_wl(&drag_offer.surface) {
-            Some(userdata) => userdata.window_id,
-            None => return,
+            Some(surface_data) => surface_data.window_id,
+            None => {
+                let parent = drag_offer
+                    .surface
+                    .data::<SurfaceData>()
+                    .and_then(|data| data.parent_surface())
+                    .and_then(SurfaceUserData::try_from_wl);
+                match parent {
+                    Some(surface_data) => surface_data.window_id,
+                    None => {
+                        log::warn!("drag entered an unknown surface; ignoring the offer");
+                        return;
+                    }
+                }
+            }
         };
 
         drag_offer.with_mime_types(|mime_types| {
@@ -56,7 +76,10 @@ impl DataDeviceHandler for WaylandState {
 
         drag_offer.set_actions(DndAction::None | DndAction::Copy, DndAction::None);
 
-        let pointer = self.pointer.as_mut().unwrap();
+        let Some(pointer) = self.pointer.as_mut() else {
+            log::warn!("drag enter with no pointer to track it");
+            return;
+        };
         let mut pstate = pointer
             .pointer()
             .data::<PointerUserData>()
@@ -75,7 +98,9 @@ impl DataDeviceHandler for WaylandState {
         _qh: &wayland_client::QueueHandle<Self>,
         _data_device: &WlDataDevice,
     ) {
-        let pointer = self.pointer.as_mut().unwrap();
+        let Some(pointer) = self.pointer.as_mut() else {
+            return;
+        };
         let mut pstate = pointer
             .pointer()
             .data::<PointerUserData>()
@@ -130,7 +155,9 @@ impl DataDeviceHandler for WaylandState {
         _qh: &wayland_client::QueueHandle<Self>,
         _data_device: &WlDataDevice,
     ) {
-        let pointer = self.pointer.as_mut().unwrap();
+        let Some(pointer) = self.pointer.as_mut() else {
+            return;
+        };
         let mut pstate = pointer
             .pointer()
             .data::<PointerUserData>()
