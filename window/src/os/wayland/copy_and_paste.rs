@@ -56,6 +56,13 @@ impl CopyAndPaste {
                     .data_offer
                     .as_ref()
                     .ok_or_else(|| anyhow!("no data offer"))?;
+                // The offer may advertise only non-text types (e.g. an
+                // image/png-only offer, which we accept for PasteImageFrom).
+                // Receiving an unadvertised mime type yields an empty read at
+                // best and a read timeout at worst, so fail fast instead.
+                if !offer.with_mime_types(|mimes| mimes.iter().any(|m| m == TEXT_MIME_TYPE)) {
+                    bail!("clipboard does not contain {} data", TEXT_MIME_TYPE);
+                }
                 let pipe = offer.receive(TEXT_MIME_TYPE.to_string())?;
                 Ok(pipe)
             }
