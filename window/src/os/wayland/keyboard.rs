@@ -98,7 +98,7 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
                 }
             }
             _ => {
-                unimplemented!()
+                log::warn!("unhandled keyboard event: {event:?}");
             }
         }
 
@@ -109,8 +109,13 @@ impl Dispatch<WlKeyboard, KeyboardData> for WaylandState {
             return;
         };
         let mut inner = win.as_ref().borrow_mut();
-        let mapper = state.keyboard_mapper.borrow_mut();
-        let mapper = mapper.as_mut().expect("no keymap");
+        let Some(mapper) = state.keyboard_mapper.as_mut() else {
+            // The compositor's keymap failed to produce a usable mapper (the
+            // failure has already been logged when it was processed); drop
+            // the event rather than panicking on every keystroke.
+            log::error!("no keymap is in effect; dropping keyboard event");
+            return;
+        };
         inner.keyboard_event(mapper, event);
     }
 }

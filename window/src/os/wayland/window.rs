@@ -1387,11 +1387,17 @@ impl WaylandWindowInner {
                 self.emit_focus(mapper, false);
             }
             WlKeyboardEvent::Key { key, state, .. } => {
-                if let Some(event) = mapper.process_wayland_key(
-                    key,
-                    state.into_result().unwrap() == KeyState::Pressed,
-                    &mut self.events,
-                ) {
+                let pressed = match state.into_result() {
+                    Ok(KeyState::Pressed) => true,
+                    Ok(_) => false,
+                    Err(err) => {
+                        // An enum value from a newer protocol version than
+                        // the one we were built against.
+                        log::warn!("ignoring key event with unknown state: {err:#?}");
+                        return;
+                    }
+                };
+                if let Some(event) = mapper.process_wayland_key(key, pressed, &mut self.events) {
                     let rep = Arc::new(Mutex::new(KeyRepeatState {
                         when: Instant::now(),
                         event,
