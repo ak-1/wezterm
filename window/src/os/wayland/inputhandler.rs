@@ -177,8 +177,14 @@ impl Dispatch<ZwpTextInputV3, TextInputData, WaylandState> for TextInputState {
                     DeadKeyStatus::None,
                 ));
             }
-            TextInputEvent::Done { serial } => {
-                *state.last_serial.borrow_mut() = serial;
+            TextInputEvent::Done { serial: _ } => {
+                // Take care NOT to copy this serial into state.last_serial:
+                // text-input-v3's done serial is a count of the commit
+                // requests we have sent on this text input, not an input
+                // serial from the seat. Since we commit on every keyboard
+                // enter/leave, writing it there would clobber the serial
+                // used for wl_data_device.set_selection and the
+                // xdg_toplevel move/resize grabs with a tiny bogus value.
                 if let Some(text) = pending_state.commit.take() {
                     state.dispatch_to_focused_window(WindowEvent::KeyEvent(KeyEvent {
                         key: KeyCode::composed(&text),
