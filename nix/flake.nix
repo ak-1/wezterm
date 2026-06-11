@@ -134,6 +134,13 @@
           # Disable cargo-auditable until https://github.com/rust-secure-code/cargo-auditable/issues/124 is fixed
           auditable = false;
 
+          # The vendored harfbuzz is built with HB_NO_MT (non-atomic refcounts) and keeps
+          # its asserts active. cargo's test harness runs the wezterm-gui tests in parallel
+          # threads, and several of them drive harfbuzz shaping concurrently, racing on a
+          # shared hb_font_funcs_t refcount -> `hb_object_is_valid` assertion -> SIGABRT.
+          # Skip the test phase (the headless passthru already does the same).
+          doCheck = false;
+
           preFixup =
             lib.optionalString stdenv.isLinux /* bash */ ''
               patchelf \
