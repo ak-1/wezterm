@@ -13,7 +13,6 @@ This is a large Cargo workspace. Use the `Makefile` targets (or the equivalent `
 - `make build` — builds the four shipped binaries: `wezterm` (CLI/client), `wezterm-gui`, `wezterm-mux-server`, `strip-ansi-escapes`.
 - `make check` / `cargo check` — fast type-check loop; preferred for iterating before a full build.
 - `make test` — runs `cargo nextest run`, then re-runs `-p wezterm-escape-parser` separately because that crate is `no_std` by default.
-- `make fmt` — **must** be run with the nightly toolchain (`cargo +nightly fmt`); CI rejects unformatted code. The repo uses `imports_granularity = "Module"` (a nightly-only rustfmt option).
 
 The repo also ships a `justfile` mirroring these as `just`-friendly recipes (`just check`, `just build`, `just test`, `just fmt`, `just run`, `just clippy`, …). Run `just --list` to see them. There are also `just test-one <name>` for a single test and Nix recipes (`just nix-build`, `just nix-shell`).
 
