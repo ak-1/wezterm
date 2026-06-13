@@ -755,6 +755,20 @@ impl AsyncReadAndWrite for Async<UnixStream> {
         stream
             .set_nonblocking(false)
             .context("clearing O_NONBLOCK on unix client socket")?;
+        // Clear the SO_RCVTIMEO/SO_SNDTIMEO set at connect time. On the async
+        // path the fd was non-blocking, so those timeouts were inert; now that
+        // we do blocking I/O they would fire on an idle connection -- after
+        // `read_timeout` (default 60s) of no inbound bytes the blocking read
+        // returns WouldBlock, which the reader treats as a fatal decode error
+        // and (since unix domains never reconnect) permanently detaches the
+        // domain. A blocking reader should simply park until data arrives; a
+        // dead server closes the socket, which surfaces as EOF immediately.
+        stream
+            .set_read_timeout(None)
+            .context("clearing read timeout on unix client socket")?;
+        stream
+            .set_write_timeout(None)
+            .context("clearing write timeout on unix client socket")?;
         // `try_clone` dups the fd; read and write are independent socket
         // directions so two threads can use the clones concurrently. A third
         // clone is kept solely to `shutdown(2)` the socket on teardown.
