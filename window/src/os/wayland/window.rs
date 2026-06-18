@@ -1262,6 +1262,31 @@ impl WaylandWindowInner {
         }
     }
 
+    /// If a paint is stranded behind an outstanding frame callback, return the
+    /// instant at which we presume that callback lost (and will therefore
+    /// repaint regardless). The message loop uses this to bound its sleep so
+    /// the [`FRAME_CALLBACK_TIMEOUT`] watchdog can actually fire on an idle,
+    /// callback-starved surface, instead of leaving the paint stranded until
+    /// the next input event drives the loop. `None` when nothing is waiting.
+    pub(crate) fn pending_paint_deadline(&self) -> Option<Instant> {
+        match &self.frame_callback {
+            Some((_, requested_at)) if self.invalidated => {
+                Some(*requested_at + FRAME_CALLBACK_TIMEOUT)
+            }
+            _ => None,
+        }
+    }
+
+    /// Watchdog companion to [`Self::pending_paint_deadline`]: if a paint is
+    /// pending behind a frame callback that has now exceeded
+    /// [`FRAME_CALLBACK_TIMEOUT`], paint it now rather than keep waiting for a
+    /// reply that may never arrive. Called from the message loop after it wakes.
+    pub(crate) fn flush_pending_paint_if_callback_lost(&mut self) {
+        if self.invalidated && !self.frame_callback_pending() {
+            self.do_paint().ok();
+        }
+    }
+
     fn invalidate(&mut self) {
         if self.frame_callback_pending() {
             self.invalidated = true;

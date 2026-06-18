@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
 use std::sync::atomic::AtomicUsize;
+use std::time::Instant;
 
 use anyhow::{bail, Context};
 use wayland_client::backend::WaylandError;
@@ -50,13 +51,63 @@ impl WaylandConnection {
         }
     }
 
+    /// Snapshot of the live windows, cloned so the state borrow is released
+    /// before we re-enter window code that may itself touch the connection.
+    fn windows(&self) -> Vec<Rc<RefCell<WaylandWindowInner>>> {
+        self.wayland_state
+            .borrow()
+            .windows
+            .borrow()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The soonest frame-callback watchdog deadline across all windows that
+    /// have a paint stranded behind an unanswered callback, if any. The
+    /// message loop uses this to bound its poll so the watchdog can fire.
+    fn soonest_pending_paint_deadline(&self) -> Option<Instant> {
+        let mut deadline: Option<Instant> = None;
+        for win in self.windows() {
+            if let Some(d) = win.borrow().pending_paint_deadline() {
+                deadline = Some(deadline.map_or(d, |cur| cur.min(d)));
+            }
+        }
+        deadline
+    }
+
+    /// Repaint any window whose pending paint has been waiting on a frame
+    /// callback longer than the watchdog timeout. Harmless when none are.
+    fn flush_lost_frame_callbacks(&self) {
+        for win in self.windows() {
+            win.borrow_mut().flush_pending_paint_if_callback_lost();
+        }
+    }
+
     fn run_message_loop_impl(&self) -> anyhow::Result<()> {
         let spawn_fd = SPAWN_QUEUE.raw_fd();
 
         while !*self.should_terminate.borrow() {
             // Run a pending spawned function; if more remain we don't want to
-            // block in poll, so we'll use a zero timeout below.
-            let timeout_ms: libc::c_int = if SPAWN_QUEUE.run() { 0 } else { -1 };
+            // block in poll, so we'll use a zero timeout below. Otherwise, if a
+            // window has a paint stranded behind a frame callback the compositor
+            // hasn't answered, bound the sleep to that callback's watchdog
+            // deadline so we wake and repaint anyway. Without this wake an idle,
+            // callback-starved surface (e.g. occluded, or with a steady cursor
+            // and no animation to poke the loop) stays frozen until an unrelated
+            // event such as a keypress drives the loop -- the reported "screen
+            // only updates after I press a key" stall.
+            let timeout_ms: libc::c_int = if SPAWN_QUEUE.run() {
+                0
+            } else {
+                match self.soonest_pending_paint_deadline() {
+                    Some(deadline) => deadline
+                        .checked_duration_since(Instant::now())
+                        .map(|d| d.as_millis().min(libc::c_int::MAX as u128) as libc::c_int)
+                        .unwrap_or(0),
+                    None => -1,
+                }
+            };
 
             // Dispatch whatever is already queued, then prepare to read more.
             // dispatch_pending must run unconditionally every iteration: events
@@ -148,6 +199,11 @@ impl WaylandConnection {
                 // the next iteration is free to dispatch.
                 drop(read_guard);
             }
+
+            // If we woke (by timeout or otherwise) and a window's frame callback
+            // has now outlived the watchdog, repaint its stranded frame rather
+            // than wait for a reply that may never come.
+            self.flush_lost_frame_callbacks();
         }
 
         Ok(())
