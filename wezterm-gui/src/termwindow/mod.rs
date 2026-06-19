@@ -380,6 +380,15 @@ pub struct TermWindow {
     terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
+    /// Cancels the mux subscription when this TermWindow is dropped. The
+    /// subscription must NOT be cancelled from inside the callback on a
+    /// transient "window not found" or WindowRemoved for our mux_window_id:
+    /// during a workspace switch / mux resync the id is briefly stale even
+    /// though this window is still very much alive. Cancelling there is what
+    /// killed pane-output repaints, leaving the screen frozen until an
+    /// unrelated event (a keypress) drove a repaint by another path.
+    /// See <https://github.com/wezterm/wezterm/pull/7444>.
+    subscription_cancelled: Arc<AtomicBool>,
     pub render_metrics: RenderMetrics,
     render_state: Option<RenderState>,
     input_map: InputMap,
@@ -696,6 +705,7 @@ impl TermWindow {
             focused: None,
             mux_window_id,
             mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
+            subscription_cancelled: Arc::new(AtomicBool::new(false)),
             fonts: Rc::clone(&fontconfig),
             render_metrics,
             dimensions,
@@ -1475,13 +1485,15 @@ impl TermWindow {
                 // will then do the check with full context.
                 let mux = Mux::get();
                 if mux.get_window(mux_window_id).is_none() {
-                    // Something inconsistent: cancel subscription
+                    // The id can be transiently stale during a workspace
+                    // switch / mux resync while this window is still alive;
+                    // skip this one notification but KEEP the subscription.
                     log::debug!(
-                        "PaneOutput: wanted mux_window_id={} from mux, but \
-                         was not found, cancel mux subscription",
+                        "PaneOutput: mux_window_id={} not currently in mux; \
+                         skipping notification but keeping subscription",
                         mux_window_id
                     );
-                    return false;
+                    return true;
                 }
                 let _ = pane_id;
             }
@@ -1502,9 +1514,17 @@ impl TermWindow {
                 if window_id != mux_window_id {
                     return true;
                 }
-                // Set the window as dead to unsubscribe from further notifications
-                dead.store(true, Ordering::Relaxed);
-                return false;
+                // A WindowRemoved matching our current mux_window_id does NOT
+                // mean this TermWindow is going away: during a workspace switch
+                // the old mux window is removed and we are reassigned a new
+                // mux_window_id via SwitchToMuxWindow. Cancelling the
+                // subscription here (the old `dead.store(true)`) is exactly what
+                // permanently stopped pane-output repaints -- the screen then
+                // only updated when a keypress triggered a repaint by another
+                // path. Keep the subscription alive; it is cancelled only when
+                // the TermWindow is dropped (see `subscription_cancelled`).
+                // <https://github.com/wezterm/wezterm/pull/7444>
+                return true;
             }
             MuxNotification::TabResized(tab_id)
             | MuxNotification::TabTitleChanged { tab_id, .. } => {
@@ -1543,7 +1563,10 @@ impl TermWindow {
         let window = self.window.clone().expect("window to be valid on startup");
         let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get();
-        let dead = Arc::new(AtomicBool::new(false));
+        // Shared with the TermWindow so that the subscription is cancelled
+        // exactly once, when the window is dropped -- never from inside the
+        // callback for a transiently-stale mux_window_id.
+        let dead = Arc::clone(&self.subscription_cancelled);
         mux.subscribe(move |n| {
             if dead.load(Ordering::Relaxed) {
                 return false;
@@ -3622,6 +3645,10 @@ impl TermWindow {
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
+        // Cancel the mux subscription now that the window is really going away.
+        // This is the ONLY place the subscription is cancelled; the callback
+        // keeps it alive across transient workspace/resync churn.
+        self.subscription_cancelled.store(true, Ordering::Relaxed);
         self.clear_all_overlays();
         if let Some(window) = self.window.take() {
             if let Some(fe) = try_front_end() {
