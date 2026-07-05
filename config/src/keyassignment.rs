@@ -564,6 +564,7 @@ pub enum KeyAssignment {
         confirm: bool,
     },
     ReloadConfiguration,
+    RebuildRenderContext,
     MoveTabRelative(isize),
     MoveTab(usize),
     ScrollByPage(NotNan<f64>),

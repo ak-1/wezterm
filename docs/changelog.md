@@ -78,6 +78,12 @@ As features stabilize some brief notes about them will accumulate here.
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
 
 #### New
+* New key assignment
+  [RebuildRenderContext](config/lua/keyassignment/RebuildRenderContext.md)
+  (also available from the command palette) to recreate the GPU render
+  context and resources for a window without restarting wezterm; useful to
+  recover from externally corrupted GPU state, such as after restoring a
+  virtual machine from a saved state.
 * The command palette now supports `PageUp`/`PageDown` navigation, renders the
   key assignment for each entry in a distinct color
   ([command_palette_key_color](config/lua/config/command_palette_key_color.md)),

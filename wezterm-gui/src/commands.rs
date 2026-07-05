@@ -1282,6 +1282,18 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["WezTerm"],
             icon: Some("md_reload"),
         },
+        RebuildRenderContext => CommandDef {
+            brief: "Rebuild the render context".into(),
+            doc: "Discards the GPU render context and creates a fresh one, \
+                  re-creating all GPU resources. Useful to recover when the \
+                  GPU state was corrupted outside of wezterm's control, \
+                  such as by restoring a VM from a saved state"
+                .into(),
+            keys: vec![],
+            args: &[ArgType::ActiveWindow],
+            menubar: &["View"],
+            icon: Some("md_reload"),
+        },
         QuitApplication => CommandDef {
             brief: "Quit WezTerm".into(),
             doc: "Quits WezTerm".into(),
@@ -2075,6 +2087,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ScrollByPage(NotNan::new(1.0).unwrap()),
         ScrollToTop,
         ScrollToBottom,
+        RebuildRenderContext,
         // ----------------- Window
         ToggleFullScreen,
         ToggleAlwaysOnTop,

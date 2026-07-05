@@ -56,7 +56,7 @@ use smol::Timer;
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, LinkedList};
 use std::ops::Add;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -364,6 +364,10 @@ enum EventState {
 
 pub struct TermWindow {
     pub window: Option<Window>,
+    /// Set once by new_window; allows re-entering self from futures
+    /// running on the main thread executor whose captures are not Send
+    /// and thus cannot ride through TermWindowNotif (eg: a gl context).
+    weak_self: Option<Weak<RefCell<TermWindow>>>,
     pub config: ConfigHandle,
     pub config_overrides: wezterm_dynamic::Value,
     os_parameters: Option<parameters::Parameters>,
@@ -576,17 +580,10 @@ impl TermWindow {
                     config::wezterm_version(),
                 );
                 self.render_state.replace(render_state);
+                Ok(())
             }
-            Err(err) => {
-                log::error!("failed to create RenderState: {}", err);
-            }
+            Err(err) => anyhow::bail!("failed to create RenderState: {err:#}"),
         }
-
-        if self.render_state.is_none() {
-            panic!("No OpenGL");
-        }
-
-        Ok(())
     }
 }
 
@@ -698,6 +695,7 @@ impl TermWindow {
             gl: None,
             webgpu: None,
             window: None,
+            weak_self: None,
             window_background,
             config: config.clone(),
             config_overrides: wezterm_dynamic::Value::default(),
@@ -801,6 +799,7 @@ impl TermWindow {
         };
 
         let tw = Rc::new(RefCell::new(myself));
+        tw.borrow_mut().weak_self = Some(Rc::downgrade(&tw));
         let tw_event = Rc::clone(&tw);
 
         let mut x = None;
@@ -1091,6 +1090,56 @@ impl TermWindow {
         );
         self.paint_impl(&mut RenderFrame::Glium(&mut frame));
         window.finish_frame(frame).is_ok()
+    }
+
+    /// Discard the GL context and build a fresh one for this window,
+    /// re-creating all GPU-allocated resources against it. This recovers
+    /// from situations where the driver-side context state was corrupted
+    /// outside of wezterm's control without the context being reported
+    /// as lost, such as a VM save/restore cycle happening around us.
+    fn rebuild_render_context(&mut self) {
+        if self.webgpu.is_some() {
+            log::error!("RebuildRenderContext is not implemented for the WebGpu front end");
+            return;
+        }
+        let (Some(window), Some(weak)) = (self.window.clone(), self.weak_self.clone()) else {
+            return;
+        };
+
+        // Drop our references to the context and everything allocated
+        // against it before asking the platform layer for a new context:
+        // on X11 these are the only references keeping the old EGL surface
+        // alive, and it must be destroyed before a replacement can be
+        // created for the same native window. do_paint skips painting
+        // while these are unset.
+        self.render_state = None;
+        self.gl = None;
+
+        promise::spawn::spawn(async move {
+            let gl = window.enable_opengl().await;
+            let Some(tw) = weak.upgrade() else { return };
+            let Ok(mut tw) = tw.try_borrow_mut() else {
+                log::error!(
+                    "RebuildRenderContext: unable to re-enter TermWindow; \
+                     trigger the action again to retry"
+                );
+                return;
+            };
+            match gl {
+                Ok(gl) => {
+                    tw.gl.replace(Rc::clone(&gl));
+                    match tw.created(RenderContext::Glium(gl)) {
+                        Ok(()) => log::info!("RebuildRenderContext: render context rebuilt"),
+                        Err(err) => log::error!("RebuildRenderContext: {err:#}"),
+                    }
+                }
+                Err(err) => {
+                    log::error!("RebuildRenderContext: enable_opengl failed: {err:#}");
+                }
+            }
+            window.invalidate();
+        })
+        .detach();
     }
 
     fn do_paint_webgpu(&mut self) -> anyhow::Result<bool> {
@@ -2793,6 +2842,7 @@ impl TermWindow {
             CloseCurrentPane { confirm } => self.close_current_pane(*confirm),
             Nop | DisableDefaultAssignment => {}
             ReloadConfiguration => config::reload(),
+            RebuildRenderContext => self.rebuild_render_context(),
             MoveTab(n) => self.move_tab(*n)?,
             MoveTabRelative(n) => self.move_tab_relative(*n)?,
             ScrollByPage(n) => self.scroll_by_page(**n, pane)?,
