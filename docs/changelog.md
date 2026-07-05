@@ -76,6 +76,12 @@ As features stabilize some brief notes about them will accumulate here.
 * windows: Improve detection of running in WSL. Thanks to @bew! #7137
 * [QuickSelect](quickselect.md) mode now hides non-matching labels as you type, making it
   easier to spot the remaining candidates. Thanks to @mr-felixoid and @bew! #7752
+* Multiplexer connections over [ssh domains](multiplexing.md) now automatically
+  reconnect and reattach when the connection fails (for example, when an idle
+  connection is dropped by a NAT gateway), matching the behavior of TLS
+  domains. Detaching the domain or quitting wezterm does not trigger a
+  reconnect, and closing the reconnection status window abandons the retry and
+  detaches the domain.
 
 #### New
 * New key assignment

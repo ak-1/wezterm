@@ -511,7 +511,18 @@ fn client_thread_blocking(
     // a blocking write, then wait for it to exit.
     let _ = shutdown_tx.try_send(());
     (*shutdown)();
-    let _ = writer_thread.join();
+    let client_destroyed = writer_thread.join().unwrap_or(false);
+
+    // If the writer saw the request channel close, every Client handle was
+    // dropped: deliberate teardown (detach or shutdown), not a connection
+    // failure. Report it as such so that a reconnectable (ssh) domain doesn't
+    // try to revive a connection that was closed on purpose -- the reader
+    // itself only ever sees the resulting EOF, which is indistinguishable
+    // from a network-level disconnect. This mirrors the async path, where
+    // `rx.recv()` failing maps to the same error.
+    if client_destroyed {
+        return Err(NotReconnectableError::ClientWasDestroyed.into());
+    }
 
     // Dropping the last `promises` Arc here fails any still-pending requests via
     // `Promises::drop`, matching the async path's teardown.
@@ -571,7 +582,9 @@ fn run_reader(
 
 /// Blocking outbound loop: wait for an outgoing PDU (or a shutdown request) and
 /// write it. The promise is registered before the write so a fast response
-/// can't race ahead of it.
+/// can't race ahead of it. Returns true if the loop ended because every
+/// `Client` handle was dropped (deliberate teardown) rather than because of a
+/// connection-level failure.
 fn run_writer(
     mut writer: Box<dyn Write + Send>,
     rx: Receiver<ReaderMessage>,
@@ -579,18 +592,23 @@ fn run_writer(
     next_serial: Arc<AtomicU64>,
     promises: Arc<Mutex<Promises>>,
     shutdown: Arc<dyn Fn() + Send + Sync>,
-) {
+) -> bool {
     enum Wake {
         Send(ReaderMessage),
+        /// The request channel closed: every Client handle was dropped,
+        /// so this is deliberate teardown (detach or process shutdown).
+        ClientDestroyed,
+        /// The reader asked us to stop: the connection itself tore down.
         Stop,
     }
 
+    let mut client_destroyed = false;
     loop {
         let wake = block_on(smol::future::or(
             async {
                 match rx.recv().await {
                     Ok(msg) => Wake::Send(msg),
-                    Err(_) => Wake::Stop,
+                    Err(_) => Wake::ClientDestroyed,
                 }
             },
             async {
@@ -618,13 +636,19 @@ fn run_writer(
             // `Readable` is only ever a marker on the async path; it is never
             // sent through the channel.
             Wake::Send(ReaderMessage::Readable) => {}
+            Wake::ClientDestroyed => {
+                client_destroyed = true;
+                break;
+            }
             Wake::Stop => break,
         }
     }
 
-    // If we're stopping because of a write error, unblock the reader (which is
-    // otherwise parked in a blocking read) so the connection tears down.
+    // If we're stopping because of a write error or client teardown, unblock
+    // the reader (which is otherwise parked in a blocking read) so the
+    // connection tears down.
     (*shutdown)();
+    client_destroyed
 }
 
 pub fn unix_connect_with_retry(
@@ -805,11 +829,23 @@ impl AsyncReadAndWrite for Async<SshStream> {
         stdin
             .set_non_blocking(false)
             .context("clearing O_NONBLOCK on ssh stdin")?;
+        // stdin/stdout are socketpair halves bridged to the ssh channel by
+        // the wezterm-ssh session thread, so `shutdown(2)` works on them.
+        // Without it a reader parked in a blocking read would never notice
+        // deliberate teardown (dropping these dups does not unpark it).
+        let stdout_shutdown = stdout
+            .try_clone()
+            .context("try_clone ssh stdout for shutdown")?;
+        let stdin_shutdown = stdin
+            .try_clone()
+            .context("try_clone ssh stdin for shutdown")?;
         Ok(BlockingSplit::Supported(BlockingHalves {
             reader: Box::new(stdout),
             writer: Box::new(stdin),
-            // ssh stdin/stdout are pipes with no `shutdown(2)`.
-            shutdown: Arc::new(|| {}),
+            shutdown: Arc::new(move || {
+                let _ = stdout_shutdown.shutdown(Shutdown::Both);
+                let _ = stdin_shutdown.shutdown(Shutdown::Both);
+            }),
         }))
     }
 }
@@ -926,13 +962,29 @@ impl Reconnectable {
             // the set of tabs and we'd have confusing and inconsistent state
             ClientDomainConfig::Unix(_) => false,
             ClientDomainConfig::Tls(_) => true,
-            // It *does* make sense to reconnect with an ssh session, but we
-            // need to grow some smarts about whether the disconnect was because
-            // we sent CTRL-D to close the last session, or whether it was a network
-            // level disconnect, because we will otherwise throw up authentication
-            // dialogs that would be annoying
-            ClientDomainConfig::Ssh(_) => false,
+            // Deliberate teardown (dropping the Client on detach or process
+            // shutdown) is reported as NotReconnectableError rather than as a
+            // connection error, so reaching the reconnect path means the ssh
+            // session or the remote proxy actually failed, which is worth
+            // retrying. If the host needs interactive auth, the prompts show
+            // up in the reconnection UI window; closing that window abandons
+            // the retry loop and detaches the domain.
+            ClientDomainConfig::Ssh(_) => true,
         }
+    }
+
+    /// Whether an UnexpectedEof from the connection should still attempt a
+    /// reconnect. For TLS, EOF means the server deliberately closed this
+    /// connection, so reconnecting is not useful. For ssh the mux PDUs are
+    /// bridged over socketpairs to the ssh channel, so a network-level
+    /// failure of the ssh session surfaces as EOF rather than as a socket
+    /// error; treating EOF as fatal would defeat reconnecting entirely. A
+    /// deliberate remote shutdown also surfaces as EOF, but the reconnect
+    /// runs the proxy with --no-auto-start (so it won't resurrect a stopped
+    /// server) and the retry loop can be abandoned by closing its UI window,
+    /// which bounds the cost of that false positive.
+    fn reconnect_on_eof(&self) -> bool {
+        matches!(&self.config, ClientDomainConfig::Ssh(_))
     }
 
     fn connect(
@@ -1340,7 +1392,7 @@ impl Client {
             const MAX_INTERVAL: Duration = Duration::from_secs(10);
 
             let mut backoff = BASE_INTERVAL;
-            loop {
+            'reconnect: loop {
                 if let Err(e) = client_thread(&mut reconnectable, local_domain_id, &mut receiver) {
                     if !reconnectable.reconnectable() || local_domain_id.is_none() {
                         log::debug!("client thread ended: {}", e);
@@ -1349,11 +1401,13 @@ impl Client {
 
                     let local_domain_id = local_domain_id.expect("checked above");
 
-                    if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
-                        if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
-                            // Don't reconnect for a simple EOF
-                            log::error!("server closed connection ({})", e);
-                            break;
+                    if !reconnectable.reconnect_on_eof() {
+                        if let Some(ioerr) = e.root_cause().downcast_ref::<std::io::Error>() {
+                            if let std::io::ErrorKind::UnexpectedEof = ioerr.kind() {
+                                // Don't reconnect for a simple EOF
+                                log::error!("server closed connection ({})", e);
+                                break;
+                            }
                         }
                     }
 
@@ -1366,11 +1420,17 @@ impl Client {
                     ui.title("wezterm: Reconnecting...");
 
                     loop {
-                        ui.sleep_with_reason(
+                        if let Err(err) = ui.sleep_with_reason(
                             &format!("client disconnected {}; will reconnect", e),
                             backoff,
-                        )
-                        .ok();
+                        ) {
+                            // The reconnection UI went away (eg: the user
+                            // closed its window). Take that as a request to
+                            // stop retrying; fall through to detaching the
+                            // domain.
+                            log::error!("giving up on reconnecting: {:#}", err);
+                            break 'reconnect;
+                        }
                         let initial = false;
                         let no_auto_start = true; // Don't auto-start on a reconnect
                         match reconnectable.connect(initial, &mut ui, no_auto_start) {

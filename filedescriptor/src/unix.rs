@@ -284,6 +284,21 @@ impl FileDescriptor {
         }
     }
 
+    #[inline]
+    pub(crate) fn shutdown_impl(&self, how: std::net::Shutdown) -> Result<()> {
+        let how = match how {
+            std::net::Shutdown::Read => libc::SHUT_RD,
+            std::net::Shutdown::Write => libc::SHUT_WR,
+            std::net::Shutdown::Both => libc::SHUT_RDWR,
+        };
+        let res = unsafe { libc::shutdown(self.handle.as_raw_file_descriptor(), how) };
+        if res != 0 {
+            Err(Error::Shutdown(std::io::Error::last_os_error()))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Attempt to duplicate the underlying handle from an object that is
     /// representable as the system `RawFileDescriptor` type and assign it to
     /// a destination file descriptor. It then returns a `FileDescriptor`

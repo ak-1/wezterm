@@ -262,6 +262,25 @@ impl FileDescriptor {
         }
     }
 
+    #[inline]
+    pub(crate) fn shutdown_impl(&self, how: std::net::Shutdown) -> Result<()> {
+        use winapi::um::winsock2::{shutdown, SD_BOTH, SD_RECEIVE, SD_SEND};
+        // A non-socket handle fails with WSAENOTSOCK
+        let how = match how {
+            std::net::Shutdown::Read => SD_RECEIVE,
+            std::net::Shutdown::Write => SD_SEND,
+            std::net::Shutdown::Both => SD_BOTH,
+        };
+        let res = unsafe { shutdown(self.as_raw_socket() as SOCKET, how) };
+        if res != 0 {
+            Err(Error::Shutdown(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            })))
+        } else {
+            Ok(())
+        }
+    }
+
     pub(crate) fn redirect_stdio_impl<F: AsRawFileDescriptor>(
         f: &F,
         stdio: StdioDescriptor,

@@ -146,6 +146,8 @@ pub enum Error {
     FdValueOutsideFdSetSize(i64),
     #[error("Only socket descriptors can change their non-blocking mode on Windows")]
     OnlySocketsNonBlocking,
+    #[error("failed to shutdown socket")]
+    Shutdown(#[source] std::io::Error),
     #[error("SetStdHandle failed")]
     SetStdHandle(#[source] std::io::Error),
 
@@ -319,6 +321,18 @@ impl FileDescriptor {
     /// that can be successfully made non-blocking.
     pub fn set_non_blocking(&mut self, non_blocking: bool) -> Result<()> {
         self.set_non_blocking_impl(non_blocking)
+    }
+
+    /// Attempt to shut down the read and/or write directions of the
+    /// underlying descriptor.  The descriptor must reference a socket
+    /// (eg: one half of a `socketpair`); other kinds of descriptor
+    /// will return an error.
+    /// Unlike dropping a duplicated handle, `shutdown` takes effect for
+    /// every duplicate referencing the same underlying socket, so it can
+    /// be used to unblock a thread that is parked in a blocking `read`
+    /// on another clone of the same descriptor.
+    pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
+        self.shutdown_impl(how)
     }
 
     /// Attempt to redirect stdio to the underlying handle and return
